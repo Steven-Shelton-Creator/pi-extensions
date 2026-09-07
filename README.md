@@ -1,6 +1,6 @@
-# pi-extensions — Fleet Architecture Execution System
+# pi-extensions — Macro Architecture Fleet
 
-10 pi extensions implementing the **Agent Fleet Architecture Execution System**. A phased, gate-checked workflow for designing software architecture using multiple specialized agents.
+**10 pi extensions** implementing the **Macro Architecture Fleet**: a phased, gate-checked workflow for designing software architecture using specialized analysis agents. The fleet sets structural boundaries before any code is written — primitive, modules, interfaces, dependencies, verification — then freezes contracts for parallel implementation.
 
 ## Quick Install
 

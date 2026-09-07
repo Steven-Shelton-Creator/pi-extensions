@@ -1,5 +1,5 @@
 /**
- * fleet-format :: Phase 3 — Format & Contract Design
+ * fleet-format :: [MACRO] Phase 3 — Format & Contract Design
  *
  * Designs the semantic formats through which modules communicate.
  * Treats API, file format, network protocol, event schema, plugin contract,

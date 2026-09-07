@@ -1,5 +1,5 @@
 /**
- * fleet-extension :: Phase 5b — Extension & Plugin Model
+ * fleet-extension :: [MACRO] Phase 5b — Extension & Plugin Model
  *
  * Determines where variability should live outside the core.
  * Prefers standalone modules with thin host adapters over

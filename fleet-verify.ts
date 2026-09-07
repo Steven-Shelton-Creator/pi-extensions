@@ -1,5 +1,5 @@
 /**
- * fleet-verify :: Phase 7 — Architecture Attack Review
+ * fleet-verify :: [MACRO] Phase 7 — Architecture Attack Review
  *
  * The verification agent attempts to break the proposed architecture.
  * Tests: replaceability, independent development, external isolation,

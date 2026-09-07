@@ -1,5 +1,5 @@
 /**
- * fleet-migration :: Phase 6b — Migration & Compatibility Planning
+ * fleet-migration :: [MACRO] Phase 6b — Migration & Compatibility Planning
  *
  * Plans incremental migration from existing systems.
  * Designs compatibility layers, coexistence periods, and progressive

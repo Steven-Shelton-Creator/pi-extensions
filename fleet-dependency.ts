@@ -1,5 +1,5 @@
 /**
- * fleet-dependency :: Phase 5 — Dependency & Adapter Isolation
+ * fleet-dependency :: [MACRO] Phase 5 — Dependency & Adapter Isolation
  *
  * Prevents external systems from contaminating internal architecture.
  * For every dependency (DB, cloud, framework, vendor API, hardware),

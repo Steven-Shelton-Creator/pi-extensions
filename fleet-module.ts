@@ -1,5 +1,5 @@
 /**
- * fleet-module :: Phase 4 — Module Boundary Decomposition
+ * fleet-module :: [MACRO] Phase 4 — Module Boundary Decomposition
  *
  * Splits the system into small independently implementable black-box modules.
  * Each module has one responsibility, documented inputs/outputs, bounded state,

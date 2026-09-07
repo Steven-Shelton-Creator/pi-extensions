@@ -1,7 +1,7 @@
 /**
- * fleet-orchestrator :: Phase 0 — Job Init + Fleet State Machine
+ * fleet-orchestrator :: [MACRO] Phase 0 — Job Init + Fleet State Machine
  *
- * The orchestrator extension for the Agent Fleet Architecture Execution System.
+ * The orchestrator extension for the Macro Architecture Fleet.
  * Maintains phase state, job definition, and dependency graph across sessions.
  * All other fleet agents register against this extension's phase gates.
  *

@@ -1,5 +1,5 @@
 /**
- * fleet-primitive :: Phase 2 — Primitive & Domain Model Identification
+ * fleet-primitive :: [MACRO] Phase 2 — Primitive & Domain Model
  *
  * Determines the fundamental information the system operates on.
  * Reads requirements and risk register, then guides primitive identification.

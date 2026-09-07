@@ -1,5 +1,5 @@
 /**
- * fleet-tooling :: Phase 6 — Tooling & Simulation Planning
+ * fleet-tooling :: [MACRO] Phase 6 — Tooling & Simulation Planning
  *
  * Makes every important contract independently observable and testable.
  * For each module/interface, defines the minimal executable harness needed

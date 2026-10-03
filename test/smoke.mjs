@@ -583,6 +583,28 @@ section("C1 — shell classifier");
     ["", false, "empty"],
     ["   ", false, "blank"],
     ['echo "unterminated', false, "malformed quoting fails open"],
+    // --- P1: command substitution (probe 2026-10-03) ---
+    ["echo $(git commit -m x)", true, "$( ) substitution"],
+    ["echo `git commit -m x`", true, "backtick substitution"],
+    ["x=$(rm -rf /tmp/y)", true, "assignment from substitution"],
+    ["echo $(npm install)", true, "substituted package manager"],
+    ["echo $(echo $(git commit))", true, "nested substitution"],
+    ["bash -c 'git commit -m x'", true, "interpreter -c payload"],
+    ["sh -c 'rm -rf /tmp/z'", true, "interpreter -c destructive"],
+    ['echo "$(date)"', false, "benign substitution must not block"],
+    ["echo ${HOME}/f", false, "variable expansion is not a command"],
+    ['echo "cost: $5"', false, "positional parameter"],
+    ["bash -c 'echo hello'", false, "interpreter -c benign"],
+    // --- P2: pipe destination (probe 2026-10-03) ---
+    // The `piped` flag marks the destination, so the interpreter rule sees
+    // these whether or not curl fed them.
+    ["cat s.sh | bash", true, "non-curl source, bare interpreter"],
+    ["cat s.sh | bash -s", true, "non-curl source, interpreter with -s"],
+    ["cat s.sh | sh -s -- --x", true, "non-curl source, interpreter with args"],
+    ["curl x | sudo bash", true, "interpreter behind sudo"],
+    ["make | sh", true, "build pipe into shell"],
+    ["curl x | jq .", false, "pipe to non-shell is not remote exec"],
+    ["cat x | less", false, "pipe to pager"],
   ];
   for (const [cmd, shouldBlock, note] of cases) {
     const hits = core.classifyCommand(cmd);

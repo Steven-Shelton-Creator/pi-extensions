@@ -362,7 +362,7 @@ export interface ShellSegment {
   argv: string[];
   raw: string;
   redirects: boolean;
-  /** True when this segment is the target of a pipe. */
+  /** True when this segment receives the output of a preceding pipe. */
   piped: boolean;
 }
 
@@ -373,11 +373,13 @@ export function tokenizeShell(command: string): ShellSegment[] {
   if (!command || typeof command !== "string") return [];
 
   const segments: ShellSegment[] = [];
+  const nested: ShellSegment[] = [];   // command substitutions, appended at the end
   let argv: string[] = [];
   let current = "";
   let raw = "";
   let redirects = false;
   let quote: '"' | "'" | null = null;
+  let pipeNext = false;
 
   const endToken = () => {
     if (current !== "") { argv.push(current); current = ""; }
@@ -391,6 +393,8 @@ export function tokenizeShell(command: string): ShellSegment[] {
     argv = [];
     raw = "";
     redirects = false;
+    // pipeNext is NOT reset here — the caller clears it after a separator has
+    // been consumed, so that the *next* segment is the one marked as destination.
   };
 
   let i = 0;
@@ -422,12 +426,17 @@ export function tokenizeShell(command: string): ShellSegment[] {
 
     const two = command.slice(i, i + 2);
     if (SEPARATORS.includes(two)) {
-      flush(two === "|");
+      // The NEXT segment is the pipe destination, not this one. Marking the
+      // source made the interpreter rule dead code and let the curl rule work
+      // only by accident.
+      flush(pipeNext);
+      pipeNext = two === "|";
       i += 2;
       continue;
     }
     if (ch === "|" || ch === ";" || ch === "\n") {
-      flush(ch === "|");
+      flush(pipeNext);
+      pipeNext = ch === "|";
       i++;
       continue;
     }
@@ -446,13 +455,47 @@ export function tokenizeShell(command: string): ShellSegment[] {
       continue;
     }
 
+    // Command substitution: $( ... ) and ` ... `. The inner text is tokenized
+    // and classified as its own segments, because anything that mutates inside
+    // a substitution mutates the same as if it had been typed directly.
+    if (ch === "`") {
+      const end = command.indexOf("`", i + 1);
+      const inner = end === -1 ? command.slice(i + 1) : command.slice(i + 1, end);
+      nested.push(...tokenizeShell(inner));
+      raw += inner;
+      i = end === -1 ? command.length : end + 1;
+      continue;
+    }
+    if (ch === "$" && command[i + 1] === "(") {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < command.length; j++) {
+        if (command[j] === "(") depth++;
+        else if (command[j] === ")") { depth--; if (depth === 0) break; }
+      }
+      const inner = command.slice(i + 2, j);
+      nested.push(...tokenizeShell(inner));
+      raw += inner;
+      i = j < command.length ? j + 1 : command.length;
+      continue;
+    }
+    // ${...} is variable expansion, not a command — consume it as one token.
+    if (ch === "$" && command[i + 1] === "{") {
+      const end = command.indexOf("}", i + 2);
+      const stop = end === -1 ? command.length : end + 1;
+      current += command.slice(i, stop);
+      raw += command.slice(i, stop);
+      i = stop;
+      continue;
+    }
+
     current += ch;
     raw += ch;
     i++;
   }
 
-  flush(false);
-  return segments;
+  flush(pipeNext);
+  return [...segments, ...nested];
 }
 
 const WRAPPERS = new Set(["sudo", "env", "command", "nohup", "time", "nice", "doas", "xargs"]);
@@ -540,9 +583,25 @@ export function classifySegment(
   const name = bareCommand(seg.argv);
   if (!name) return null;
 
-  // R4: pipe-to-shell fails closed regardless of parse confidence.
-  if (seg.piped && SHELL_INTERPRETERS.has(name) && seg.argv.length === 1) {
+  // A pipe whose destination is a shell interpreter is remote execution,
+  // regardless of what fed it and of what flags the interpreter carries.
+  // `curl x | sh`, `cat s.sh | bash -s`, `make | sh` all land here.
+  if (seg.piped && SHELL_INTERPRETERS.has(name)) {
     return { kind: "remote-exec", why: `pipe into ${name}` };
+  }
+
+  // `bash -c '<command>'` runs an inline command; classify the payload.
+  if (SHELL_INTERPRETERS.has(name)) {
+    const cIdx = seg.argv.indexOf("-c");
+    if (cIdx !== -1 && seg.argv[cIdx + 1]) {
+      const inner = classifyCommand(seg.argv[cIdx + 1], extra);
+      if (inner.length > 0) {
+        return {
+          kind: "remote-exec",
+          why: `${name} -c '${seg.argv[cIdx + 1].slice(0, 40)}' (${inner[0].kind})`,
+        };
+      }
+    }
   }
 
   if (VCS_MUTATIONS[name]) {
@@ -576,10 +635,6 @@ export function classifySegment(
   }
   if (name === "tee") {
     return { kind: "redirect-write", why: "tee" };
-  }
-  if (name === "curl" || name === "wget") {
-    const pipedNext = seg.piped;
-    if (pipedNext) return { kind: "remote-exec", why: `${name} piped onward` };
   }
 
   if (seg.redirects) {

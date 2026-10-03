@@ -1,12 +1,27 @@
 {
-  "name": "pi-extensions-macro-fleet",
-  "version": "0.2.0",
-  "description": "Phase-gated architecture workflow extensions for pi, with tool-level enforcement.",
+  "name": "pi-force",
+  "version": "0.4.0",
+  "description": "Phase-gated architecture workflow extensions for pi, with tool-level enforcement and assignment confinement.",
   "type": "module",
   "license": "MIT",
   "private": true,
+  "pi": {
+    "extensions": [
+      "./fleet-orchestrator.ts",
+      "./fleet-requirements.ts",
+      "./fleet-primitive.ts",
+      "./fleet-module.ts",
+      "./fleet-dependency.ts",
+      "./fleet-extension.ts",
+      "./fleet-tooling.ts",
+      "./fleet-verify.ts",
+      "./fleet-format.ts",
+      "./fleet-migration.ts"
+    ]
+  },
   "scripts": {
-    "check": "node --check fleet-core.ts"
+    "check": "node --check fleet-core.ts",
+    "test": "node test/smoke.mjs"
   },
   "dependencies": {},
   "devDependencies": {}

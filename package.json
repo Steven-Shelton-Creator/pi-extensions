@@ -1,0 +1,13 @@
+{
+  "name": "pi-extensions-macro-fleet",
+  "version": "0.2.0",
+  "description": "Phase-gated architecture workflow extensions for pi, with tool-level enforcement.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "check": "node --check fleet-core.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

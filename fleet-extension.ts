@@ -1,27 +1,30 @@
 /**
- * fleet-extension :: [MACRO] Phase 5b — Extension & Plugin Model
+ * fleet-extension :: Phase 5b — Extension Points & Host Integration
  *
- * Determines where variability should live outside the core.
- * Prefers standalone modules with thin host adapters over
- * host-specific plugins where possible.
+ * Declares where the system accepts extensions, and which module hosts each one.
+ * An extension point without a host and an interface is a wish, not a seam.
  *
- * Gate: Phase 4 (MODULE BOUNDARIES) must be complete.
+ * Commands: /fleet:extensions /fleet:exthosts
+ * Tools:    fleet_add_extension_point, fleet_add_host, fleet_list_extensions
  *
- * /fleet:extensions  — define extension/plugin boundaries
- * /fleet:exthosts    — define host integration points
+ * Usage: pi -e extensions/fleet-extension.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  EXT_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface ExtensionPoint {
+export interface ExtensionPoint {
   id: string;
   capability: string;
   description: string;
-  hostModule: string;       // MOD-xxx
+  hostModule: string;
   preferred: "standalone-module" | "host-plugin";
   inputs: string[];
   outputs: string[];
@@ -32,249 +35,250 @@ interface ExtensionPoint {
   status: "proposed" | "approved" | "implemented";
 }
 
-interface HostIntegration {
+export interface HostIntegration {
   id: string;
   name: string;
   hostModule: string;
-  registeredExtensions: string[];  // EXT-xxx
-  adapterInterface: string;       // FMT-xxx
-  dynamicDiscovery: boolean;       // can extensions register at runtime?
+  registeredExtensions: string[];
+  adapterInterface: string;
+  dynamicDiscovery: boolean;
   status: "draft" | "approved";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Operations ──────────────────────────────────────────────────────────────
 
-const ARCH_DIR = "architecture";
-const EXT_FILE = "08_EXTENSION_REGISTRY.md";
-
-function cwd(): string {
-  return process.cwd();
+function points(state: FleetState): ExtensionPoint[] {
+  if (!state.extensionPoints) state.extensionPoints = [];
+  return state.extensionPoints as ExtensionPoint[];
 }
 
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
+function hosts(state: FleetState): HostIntegration[] {
+  if (!state.hostIntegrations) state.hostIntegrations = [];
+  return state.hostIntegrations as HostIntegration[];
 }
 
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
+export function addExtensionPoint(state: FleetState, input: Partial<ExtensionPoint>) {
+  const list = points(state);
+  if (!input.capability?.trim()) return { ok: false, message: "capability is required" };
+  if (!input.hostModule?.trim()) return { ok: false, message: "hostModule is required — an extension point without a host cannot be implemented" };
+
+  const id = input.id?.trim() || `EXT-${String(list.length + 1).padStart(3, "0")}`;
+  if (list.some((e) => e.id === id)) return { ok: false, message: `${id} already exists` };
+
+  const p: ExtensionPoint = {
+    id,
+    capability: input.capability.trim(),
+    description: input.description?.trim() || "",
+    hostModule: input.hostModule.trim(),
+    preferred: input.preferred === "standalone-module" ? "standalone-module" : "host-plugin",
+    inputs: input.inputs || [],
+    outputs: input.outputs || [],
+    parameters: input.parameters || [],
+    defaultConfig: input.defaultConfig?.trim() || "",
+    hostRequirements: input.hostRequirements || [],
+    optional: input.optional !== false,
+    status: "proposed",
+  };
+  list.push(p);
+  saveState(state);
+  writeExtensionFile(state);
+  audit(`extension point ${id} ${p.capability}`, state);
+  return { ok: true, message: `${id} recorded (hosted by ${p.hostModule})` };
 }
 
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try { return JSON.parse(readFileSync(jsonPath, "utf8")); }
-    catch { return null; }
-  }
-  return null;
+export function addHost(state: FleetState, input: Partial<HostIntegration>) {
+  const list = hosts(state);
+  if (!input.name?.trim()) return { ok: false, message: "name is required" };
+  if (!input.hostModule?.trim()) return { ok: false, message: "hostModule is required" };
+  if (!input.adapterInterface?.trim()) return { ok: false, message: "adapterInterface is required — a host without an interface cannot constrain what it loads" };
+
+  const id = input.id?.trim() || `HST-${String(list.length + 1).padStart(3, "0")}`;
+  if (list.some((h) => h.id === id)) return { ok: false, message: `${id} already exists` };
+
+  const h: HostIntegration = {
+    id,
+    name: input.name.trim(),
+    hostModule: input.hostModule.trim(),
+    registeredExtensions: input.registeredExtensions || [],
+    adapterInterface: input.adapterInterface.trim(),
+    dynamicDiscovery: input.dynamicDiscovery === true,
+    status: "draft",
+  };
+  list.push(h);
+  saveState(state);
+  writeExtensionFile(state);
+  audit(`host ${id} ${h.name}`, state);
+  return { ok: true, message: `${id} hosts ${h.registeredExtensions.length} extension(s)` };
 }
 
-// ─── Writers ─────────────────────────────────────────────────────────────────
+// ─── Writer ──────────────────────────────────────────────────────────────────
 
-function writeExtensionFile(exts: ExtensionPoint[], hosts: HostIntegration[]) {
+function writeExtensionFile(state: FleetState) {
   ensureArchDir();
-
-  const lines = ["# Extension Registry", "", `*Generated by fleet-extension · ${new Date().toISOString()}*`, ""];
-
-  lines.push("## Extension Points");
-  lines.push("");
-  lines.push("| ID | Capability | Host Module | Model | Optional | Status |");
-  lines.push("|---|---|---|---|---|---|");
-  for (const e of exts) {
-    const modelLabel = e.preferred === "standalone-module" ? "🧩 Standalone" : "🔌 Host Plugin";
-    lines.push(`| ${e.id} | ${e.capability} | ${e.hostModule} | ${modelLabel} | ${e.optional ? "✅" : "❌"} | ${e.status} |`);
+  const e = points(state);
+  const h = hosts(state);
+  if (e.length === 0 && h.length === 0) {
+    writeFileSync(archPath(EXT_FILE), "# Extension Registry\n\n*No extension points recorded yet.*\n", "utf8");
+    return;
   }
-  lines.push("");
-
-  for (const e of exts) {
-    lines.push(`### ${e.id} — ${e.capability}`);
-    lines.push(`**Host Module:** ${e.hostModule}  **Model:** ${e.preferred}  **Status:** ${e.status}`);
-    lines.push(`**Optional:** ${e.optional ? "Yes. System works without it." : "Required for core functionality."}`);
-    lines.push("");
-    if (e.description) { lines.push(e.description); lines.push(""); }
-    lines.push("**Inputs:** " + (e.inputs.join(", ") || "—"));
-    lines.push("**Outputs:** " + (e.outputs.join(", ") || "—"));
-    lines.push("**Parameters:** " + (e.parameters.join(", ") || "—"));
-    lines.push("**Host Requirements:** " + (e.hostRequirements.join(", ") || "—"));
-    lines.push("---");
-    lines.push("");
+  const lines = [
+    "# Extension Registry",
+    "",
+    `*Generated by fleet-extension · ${new Date().toISOString()}*`,
+    "",
+    "| ID | Capability | Host Module | Preferred | Optional | Status |",
+    "|---|---|---|---|---|---|",
+  ];
+  for (const x of e) {
+    lines.push(`| ${x.id} | ${x.capability} | ${x.hostModule} | ${x.preferred} | ${x.optional ? "yes" : "no"} | ${x.status} |`);
   }
-
-  if (hosts.length > 0) {
-    lines.push("## Host Integration Points");
+  lines.push("", "---", "");
+  for (const x of e) {
+    lines.push(`## ${x.id} — ${x.capability}`);
     lines.push("");
-    for (const h of hosts) {
-      lines.push(`### ${h.id} — ${h.name}`);
-      lines.push(`**Host Module:** ${h.hostModule}`);
-      lines.push(`**Adapter Interface:** ${h.adapterInterface || "—"}`);
-      lines.push(`**Dynamic Discovery:** ${h.dynamicDiscovery ? "✅ Extensions can register at runtime" : "❌ Static registration"}`);
-      lines.push(`**Registered Extensions:** ${h.registeredExtensions.join(", ") || "—"}`);
-      lines.push("---");
+    lines.push(`**Host Module:** ${x.hostModule}  **Preferred:** ${x.preferred}`);
+    lines.push(`**Status:** ${x.status}  **Optional:** ${x.optional ? "yes" : "no"}`);
+    lines.push("");
+    lines.push(x.description || "_unspecified_");
+    lines.push("");
+    for (const [heading, values] of [
+      ["Inputs", x.inputs], ["Outputs", x.outputs],
+      ["Parameters", x.parameters], ["Host Requirements", x.hostRequirements],
+    ] as const) {
+      lines.push(`### ${heading}`);
+      if (values.length) for (const v of values) lines.push(`- ${v}`);
+      else lines.push("_none_");
       lines.push("");
     }
+    lines.push(`**Default Config:** ${x.defaultConfig || "_none_"}`);
+    lines.push("");
+    lines.push("---", "");
   }
-
-  if (exts.length === 0) lines.push("*No extension points defined yet.*");
+  if (h.length > 0) {
+    lines.push("## Host Integrations", "");
+    lines.push("| ID | Name | Host Module | Adapter Interface | Dynamic | Status |", "|---|---|---|---|---|---|");
+    for (const x of h) {
+      lines.push(`| ${x.id} | ${x.name} | ${x.hostModule} | ${x.adapterInterface} | ${x.dynamicDiscovery ? "yes" : "no"} | ${x.status} |`);
+    }
+    lines.push("");
+    for (const x of h) {
+      lines.push(`## ${x.id} — ${x.name}`);
+      lines.push("");
+      lines.push(`**Host Module:** ${x.hostModule}`);
+      lines.push(`**Adapter Interface:** ${x.adapterInterface}`);
+      lines.push(`**Dynamic Discovery:** ${x.dynamicDiscovery ? "yes" : "no"}  **Status:** ${x.status}`);
+      lines.push("");
+      lines.push("### Registered Extensions");
+      if (x.registeredExtensions.length) for (const r of x.registeredExtensions) lines.push(`- ${r}`);
+      else lines.push("_none_");
+      lines.push("");
+      lines.push("---", "");
+    }
+  }
   writeFileSync(archPath(EXT_FILE), lines.join("\n"), "utf8");
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let exts: ExtensionPoint[] = [];
-  let hosts: HostIntegration[] = [];
-
-  pi.on("session_start", async () => {
-    const statePath = archPath("ext-state.json");
-    if (existsSync(statePath)) {
-      try {
-        const saved = JSON.parse(readFileSync(statePath, "utf8"));
-        exts = saved.exts || [];
-        hosts = saved.hosts || [];
-      } catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state?.job?.objective) {
-      ctx.ui.notify("No job initialized.", "warning"); return false;
-    }
-    if (!fleet.state.phaseGates?.[4]) {
-      ctx.ui.notify("Phase 4 (MODULE BOUNDARIES) not complete.", "warning"); return false;
-    }
-    return true;
-  }
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(archPath("ext-state.json"), JSON.stringify({ exts, hosts }, null, 2), "utf8");
-    writeExtensionFile(exts, hosts);
-  }
-
-  // ─── Command: fleet:extensions ────────────────────────────────────────
 
   pi.registerCommand("fleet:extensions", {
     description: "Define extension/plugin boundaries (Phase 5b)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify(
-        "Extension points: where should variability live outside the core? Prefer standalone modules over host plugins.",
-        "info"
-      );
-
-      let addMore = true;
-      while (addMore) {
-        const capability = await ctx.ui.input(
-          `Extension #${exts.length + 1} capability (e.g., 'Authentication Provider', 'Storage Backend', 'Notification Channel') — or blank to stop`,
-          ""
-        );
-        if (!capability) { addMore = false; break; }
-
+      const state = loadState();
+      for (;;) {
+        const capability = await ctx.ui.input("Capability (blank to finish)", "");
+        if (!capability) break;
+        const host = await ctx.ui.input("Host module (MOD id)", "");
         const desc = await ctx.ui.input("Description", "");
-        const hostModule = await ctx.ui.input("Host module (MOD-xxx)", "");
-
-        const modelRaw = await ctx.ui.select("Preferred model", [
-          { label: "🧩 Standalone module (thin host adapter)", value: "standalone-module" },
-          { label: "🔌 Host-specific plugin", value: "host-plugin" },
-        ]);
-        const preferred = (modelRaw || "standalone-module") as "standalone-module" | "host-plugin";
-
-        const inputsRaw = await ctx.ui.input("Inputs (comma-separated)", "");
-        const inputs = inputsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const outputsRaw = await ctx.ui.input("Outputs (comma-separated)", "");
-        const outputs = outputsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const paramsRaw = await ctx.ui.input("Parameters (comma-separated)", "");
-        const parameters = paramsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const optional = await ctx.ui.confirm("Optional?", "System works without this extension?");
-        const id = `EXT-${String(exts.length + 1).padStart(3, "0")}`;
-
-        exts.push({
-          id,
-          capability,
-          description: desc || "",
-          hostModule: hostModule || "—",
-          preferred,
-          inputs,
-          outputs,
-          parameters,
-          defaultConfig: "",
-          hostRequirements: [],
-          optional,
-          status: "proposed",
-        });
-        saveState();
-        ctx.ui.notify(`🧩 ${id} — "${capability}" registered (${preferred === "standalone-module" ? "standalone" : "plugin"})`, "info");
-
-        // Check for dynamic discovery
-        const dynamic = await ctx.ui.confirm("Supports dynamic discovery?", "Can extensions register at runtime without host modification?");
-        if (dynamic || hosts.length === 0) {
-          const host = hosts.find((h) => h.hostModule === hostModule);
-          if (host) {
-            host.registeredExtensions.push(id);
-          } else {
-            hosts.push({
-              id: `HOST-${String(hosts.length + 1).padStart(3, "0")}`,
-              name: `${hostModule || "unknown"} host`,
-              hostModule: hostModule || "—",
-              registeredExtensions: [id],
-              adapterInterface: "",
-              dynamicDiscovery: dynamic,
-              status: "draft",
-            });
-          }
-          saveState();
-        }
-
-        const more = await ctx.ui.confirm("Add another extension?", "");
-        if (!more) addMore = false;
+        const res = addExtensionPoint(state, { capability, hostModule: host, description: desc });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
-
-      saveState();
-      ctx.ui.notify(`✅ ${exts.length} extension points defined`, "info");
     },
   });
-
-  // ─── Command: fleet:exthosts ──────────────────────────────────────────
 
   pi.registerCommand("fleet:exthosts", {
     description: "Define host integration points for extensions",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input("Host name (e.g., 'Core Storage Host') — or blank to stop", "");
-        if (!name) { addMore = false; break; }
-
-        const hostModule = await ctx.ui.input("Host module (MOD-xxx)", "");
-        const adapterInterface = await ctx.ui.input("Adapter interface (FMT-xxx)", "");
-
-        const dynamic = await ctx.ui.confirm("Dynamic discovery?", "Can extensions register at runtime?");
-        const registeredRaw = await ctx.ui.input("Registered extension IDs (EXT-xxx, comma)", "");
-        const registered = registeredRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const id = `HOST-${String(hosts.length + 1).padStart(3, "0")}`;
-        hosts.push({
-          id,
-          name,
-          hostModule: hostModule || "—",
-          registeredExtensions: registered,
-          adapterInterface: adapterInterface || "",
-          dynamicDiscovery: dynamic,
-          status: "draft",
-        });
-        saveState();
-        ctx.ui.notify(`🏠 ${id} — "${name}" registered`, "info");
-
-        const more = await ctx.ui.confirm("Add another host?", "");
-        if (!more) addMore = false;
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Host name (blank to finish)", "");
+        if (!name) break;
+        const host = await ctx.ui.input("Host module (MOD id)", "");
+        const iface = await ctx.ui.input("Adapter interface (FMT id)", "");
+        const res = addHost(state, { name, hostModule: host, adapterInterface: iface });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
+    },
+  });
 
-      saveState();
-      ctx.ui.notify(`✅ ${hosts.length} host integration points defined`, "info");
+  pi.registerTool({
+    name: "fleet_add_extension_point",
+    label: "Add Extension Point",
+    description:
+      "Declare a seam where the system accepts extensions. hostModule must be an existing MOD- id.",
+    parameters: Type.Object({
+      capability: Type.String(),
+      hostModule: Type.String({ description: "MOD- id that hosts the seam" }),
+      description: Type.Optional(Type.String()),
+      preferred: Type.Optional(
+        Type.Union([Type.Literal("standalone-module"), Type.Literal("host-plugin")])
+      ),
+      inputs: Type.Optional(Type.Array(Type.String())),
+      outputs: Type.Optional(Type.Array(Type.String())),
+      parameters: Type.Optional(Type.Array(Type.String())),
+      defaultConfig: Type.Optional(Type.String()),
+      hostRequirements: Type.Optional(Type.Array(Type.String())),
+      optional: Type.Optional(Type.Boolean({ description: "Default true" })),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addExtensionPoint(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_add_host",
+    label: "Add Host Integration",
+    description:
+      "Declare a host that loads extensions. adapterInterface must be an existing FMT- contract that constrains what the host accepts.",
+    parameters: Type.Object({
+      name: Type.String(),
+      hostModule: Type.String({ description: "MOD- id" }),
+      adapterInterface: Type.String({ description: "FMT- id" }),
+      registeredExtensions: Type.Optional(Type.Array(Type.String(), { description: "EXT- ids" })),
+      dynamicDiscovery: Type.Optional(Type.Boolean()),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addHost(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_list_extensions",
+    label: "List Extension Points",
+    description: "List every extension point and host integration.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      const state = loadState();
+      const e = points(state);
+      const h = hosts(state);
+      const lines = [
+        ...e.map((x) => `${x.id} — ${x.capability} (host ${x.hostModule})`),
+        ...h.map((x) => `${x.id} — host ${x.name} → ${x.adapterInterface}`),
+      ];
+      const text = lines.length === 0 ? "No extension points recorded." : lines.join("\n");
+      return { content: [{ type: "text", text }], details: { points: e.length, hosts: h.length } };
     },
   });
 }

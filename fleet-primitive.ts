@@ -1,22 +1,26 @@
 /**
- * fleet-primitive :: [MACRO] Phase 2 — Primitive & Domain Model
+ * fleet-primitive :: Phase 2 — System Primitive + Entity Multiplicity
  *
- * Determines the fundamental information the system operates on.
- * Reads requirements and risk register, then guides primitive identification.
+ * Identifies the primitive abstraction the whole system reduces to, and the
+ * cardinality rules for each entity (zero/one/many/nested/shared).
  *
- * Gate: Phase 1 (REQUIREMENTS + RISKS) must be complete.
+ * Commands: /fleet:primitive /fleet:multiplicity
+ * Tools:    fleet_propose_primitive, fleet_select_primitive, fleet_define_entity
  *
- * /fleet:primitive       — identify and document the system primitive
- * /fleet:multiplicity    — define multiplicity for key entities
+ * Usage: pi -e extensions/fleet-primitive.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  PRIM_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface PrimitiveCandidate {
+export interface PrimitiveCandidate {
   name: string;
   meaning: string;
   operations: string[];
@@ -26,13 +30,7 @@ interface PrimitiveCandidate {
   limitations: string[];
 }
 
-interface PrimitiveState {
-  selected: PrimitiveCandidate | null;
-  candidates: PrimitiveCandidate[];
-  entities: EntityMultiplicity[];
-}
-
-interface EntityMultiplicity {
+export interface EntityMultiplicity {
   name: string;
   zeroAllowed: boolean;
   oneAllowed: boolean;
@@ -42,103 +40,144 @@ interface EntityMultiplicity {
   notes: string;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-const ARCH_DIR = "architecture";
-const PRIM_FILE = "03_PRIMITIVE.md";
-
-function cwd(): string {
-  return process.cwd();
+export interface PrimitiveState {
+  selected: PrimitiveCandidate | null;
+  candidates: PrimitiveCandidate[];
+  entities: EntityMultiplicity[];
 }
 
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
+// ─── Operations ──────────────────────────────────────────────────────────────
+
+function primState(state: FleetState): PrimitiveState {
+  if (!state.primitive) state.primitive = { selected: null, candidates: [], entities: [] };
+  return state.primitive;
 }
 
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
-}
-
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try {
-      return JSON.parse(readFileSync(jsonPath, "utf8"));
-    } catch {
-      return null;
-    }
+export function proposePrimitive(state: FleetState, c: Partial<PrimitiveCandidate>) {
+  if (!c.name?.trim()) return { ok: false, message: "name is required" };
+  const ps = primState(state);
+  if (ps.candidates.some((x) => x.name.toLowerCase() === c.name!.toLowerCase())) {
+    return { ok: false, message: `Candidate "${c.name}" already proposed` };
   }
-  return null;
+  ps.candidates.push({
+    name: c.name.trim(),
+    meaning: c.meaning?.trim() || "",
+    operations: c.operations || [],
+    invariants: c.invariants || [],
+    multiplicity: c.multiplicity?.trim() || "",
+    advantages: c.advantages || [],
+    limitations: c.limitations || [],
+  });
+  saveState(state);
+  writePrimitiveFile(state);
+  audit(`primitive candidate ${c.name}`, state);
+  return { ok: true, message: `Candidate "${c.name}" recorded (${ps.candidates.length} total)` };
+}
+
+export function selectPrimitive(state: FleetState, name: string) {
+  const ps = primState(state);
+  const hit = ps.candidates.find((c) => c.name.toLowerCase() === name.toLowerCase());
+  if (!hit) {
+    const known = ps.candidates.map((c) => c.name).join(", ") || "none";
+    return { ok: false, message: `No candidate named "${name}". Candidates: ${known}` };
+  }
+  ps.selected = hit;
+  saveState(state);
+  writePrimitiveFile(state);
+  audit(`primitive selected ${name}`, state);
+  return { ok: true, message: `Primitive selected: ${hit.name}` };
+}
+
+export function defineEntity(state: FleetState, e: Partial<EntityMultiplicity>) {
+  if (!e.name?.trim()) return { ok: false, message: "name is required" };
+  const ps = primState(state);
+  const card: boolean[] = [!!e.zeroAllowed, !!e.oneAllowed, !!e.manyAllowed];
+  if (!card.some(Boolean)) {
+    return { ok: false, message: "An entity must allow at least one of zero / one / many" };
+  }
+  const existing = ps.entities.find((x) => x.name.toLowerCase() === e.name!.toLowerCase());
+  const entity: EntityMultiplicity = {
+    name: e.name.trim(),
+    zeroAllowed: !!e.zeroAllowed,
+    oneAllowed: !!e.oneAllowed,
+    manyAllowed: !!e.manyAllowed,
+    nested: !!e.nested,
+    shared: !!e.shared,
+    notes: e.notes?.trim() || "",
+  };
+  if (existing) Object.assign(existing, entity);
+  else ps.entities.push(entity);
+  saveState(state);
+  writePrimitiveFile(state);
+  audit(`entity multiplicity ${entity.name}`, state);
+  return { ok: true, message: `${entity.name} cardinality set` };
 }
 
 // ─── Writer ──────────────────────────────────────────────────────────────────
 
-function writePrimitiveFile(state: PrimitiveState) {
+function writePrimitiveFile(state: FleetState) {
   ensureArchDir();
-  const lines = [
-    "# Primitive & Domain Model",
-    "",
-    `*Generated by fleet-primitive · ${new Date().toISOString()}*`,
-    "",
-  ];
+  const ps = primState(state);
+  const lines = ["# Primitive & Domain Model", "", `*Generated by fleet-primitive · ${new Date().toISOString()}*`, ""];
 
-  if (state.selected) {
-    const p = state.selected;
-    lines.push("## Selected Primitive", "");
-    lines.push(`**Name:** ${p.name}`);
-    lines.push(`**Meaning:** ${p.meaning}`);
-    lines.push("");
-    lines.push("### Operations");
-    for (const op of p.operations) lines.push(`- ${op}`);
-    lines.push("");
-    lines.push("### Invariants");
-    for (const inv of p.invariants) lines.push(`- ${inv}`);
-    lines.push("");
-    lines.push(`**Multiplicity:** ${p.multiplicity}`);
-    lines.push("");
-    lines.push("### Advantages");
-    for (const a of p.advantages) lines.push(`- ${a}`);
-    lines.push("");
-    lines.push("### Limitations");
-    for (const l of p.limitations) lines.push(`- ${l}`);
-    lines.push("");
-    lines.push("---");
-    lines.push("");
+  if (!ps.selected && ps.candidates.length === 0) {
+    writeFileSync(archPath(PRIM_FILE), "# Primitive & Domain Model\n\n*No primitive proposed yet.*\n", "utf8");
+    return;
   }
 
-  if (state.candidates.length > 0) {
+  if (ps.selected) {
+    const p = ps.selected;
+    lines.push("## Selected Primitive", "");
+    lines.push(`**Name:** ${p.name}`);
+    lines.push(`**Meaning:** ${p.meaning || "_undefined_"}`);
+    lines.push("");
+    lines.push("### Operations");
+    if (p.operations.length) for (const o of p.operations) lines.push(`- ${o}`);
+    else lines.push("_none_");
+    lines.push("");
+    lines.push("### Invariants");
+    if (p.invariants.length) for (const i of p.invariants) lines.push(`- ${i}`);
+    else lines.push("_none_");
+    lines.push("");
+    lines.push(`**Multiplicity:** ${p.multiplicity || "_unspecified_"}`);
+    lines.push("");
+    lines.push("### Advantages");
+    if (p.advantages.length) for (const a of p.advantages) lines.push(`- ${a}`);
+    else lines.push("_none_");
+    lines.push("");
+    lines.push("### Limitations");
+    if (p.limitations.length) for (const l of p.limitations) lines.push(`- ${l}`);
+    else lines.push("_none_");
+    lines.push("");
+    lines.push("---", "");
+  }
+
+  if (ps.entities.length > 0) {
+    lines.push("## Entity Multiplicity", "");
+    lines.push("| Entity | Zero | One | Many | Nested | Shared | Notes |", "|---|---|---|---|---|---|---|");
+    for (const e of ps.entities) {
+      lines.push(
+        `| ${e.name} | ${e.zeroAllowed ? "✅" : "❌"} | ${e.oneAllowed ? "✅" : "❌"} | ${e.manyAllowed ? "✅" : "❌"} | ${e.nested ? "✅" : "❌"} | ${e.shared ? "✅" : "❌"} | ${e.notes || "—"} |`
+      );
+    }
+    lines.push("", "---", "");
+  }
+
+  const others = ps.candidates.filter((c) => c.name !== ps.selected?.name);
+  if (others.length > 0) {
     lines.push("## Candidates Considered", "");
-    for (const c of state.candidates) {
-      if (state.selected && c.name === state.selected.name) continue;
+    for (const c of others) {
       lines.push(`### ${c.name}`);
-      lines.push(c.meaning);
+      lines.push(c.meaning || "");
       lines.push("");
       lines.push("**Advantages:**");
       for (const a of c.advantages) lines.push(`- ${a}`);
       lines.push("");
       lines.push("**Limitations:**");
       for (const l of c.limitations) lines.push(`- ${l}`);
-      lines.push("---");
       lines.push("");
     }
-  }
-
-  if (state.entities.length > 0) {
-    lines.push("## Entity Multiplicity", "");
-    lines.push("| Entity | Zero | One | Many | Nested | Shared | Notes |");
-    lines.push("|---|---|---|---|---|---|---|");
-    for (const e of state.entities) {
-      lines.push(
-        `| ${e.name} | ${e.zeroAllowed ? "✅" : "❌"} | ${e.oneAllowed ? "✅" : "❌"} | ${e.manyAllowed ? "✅" : "❌"} | ${e.nested ? "✅" : "❌"} | ${e.shared ? "✅" : "❌"} | ${e.notes} |`
-      );
-    }
-    lines.push("");
-  }
-
-  if (!state.selected && state.candidates.length === 0) {
-    lines.push("*No primitive identified yet.*");
-    lines.push("");
+    lines.push("---", "");
   }
 
   writeFileSync(archPath(PRIM_FILE), lines.join("\n"), "utf8");
@@ -147,156 +186,104 @@ function writePrimitiveFile(state: PrimitiveState) {
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let primState: PrimitiveState = {
-    selected: null,
-    candidates: [],
-    entities: [],
-  };
-
-  // Restore
-  pi.on("session_start", async () => {
-    const statePath = archPath("prim-state.json");
-    if (existsSync(statePath)) {
-      try {
-        const saved = JSON.parse(readFileSync(statePath, "utf8"));
-        primState = saved;
-      } catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state || !fleet.state.job?.objective) {
-      ctx.ui.notify("No job initialized. Run /fleet:new-job first.", "warning");
-      return false;
-    }
-    if (!fleet.state.phaseGates?.[1]) {
-      ctx.ui.notify("Phase 1 (REQUIREMENTS + RISKS) not complete. Run /fleet:requirements and /fleet:risks, then advance with /fleet:phase 2.", "warning");
-      return false;
-    }
-    return true;
-  }
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(archPath("prim-state.json"), JSON.stringify(primState, null, 2), "utf8");
-    writePrimitiveFile(primState);
-  }
-
-  // ─── Command: fleet:primitive ──────────────────────────────────────────
 
   pi.registerCommand("fleet:primitive", {
     description: "Identify the system primitive (Phase 2)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify(
-        "Primitive identification. The primitive is the fundamental information the system operates on — the atomic unit of meaning.",
-        "info"
-      );
-
-      // Read existing requirements for context
-      let reqContext = "";
-      const reqPath = archPath("01_REQUIREMENTS.md");
-      if (existsSync(reqPath)) {
-        reqContext = readFileSync(reqPath, "utf8").slice(0, 2000);
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Candidate primitive name (blank to finish)", "");
+        if (!name) break;
+        const meaning = await ctx.ui.input("What it means", "");
+        const ops = await ctx.ui.input("Operations (comma-separated)", "");
+        const inv = await ctx.ui.input("Invariants (comma-separated)", "");
+        const adv = await ctx.ui.input("Advantages (comma-separated)", "");
+        const lim = await ctx.ui.input("Limitations (comma-separated)", "");
+        const split = (s: string) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean) : []);
+        const res = proposePrimitive(state, {
+          name, meaning, operations: split(ops), invariants: split(inv),
+          advantages: split(adv), limitations: split(lim),
+        });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
+      ctx.ui.notify("[fleet] Candidate primitives recorded. Use /fleet:multiplicity next.", "info");
+    },
+  });
 
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input(
-          `Candidate primitive #${primState.candidates.filter((c) => c.name !== primState.selected?.name).length + 1} name (e.g., 'Document', 'Event', 'Entity', 'Message') — or blank to stop`,
-          ""
-        );
-        if (!name) { addMore = false; break; }
-
-        const meaning = await ctx.ui.input(`What does "${name}" represent in the system?`, "");
-        const opsRaw = await ctx.ui.input("Operations on this primitive (comma-separated, e.g., 'create, read, update, delete')", "create, read, update, delete");
-        const operations = opsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const invRaw = await ctx.ui.input("Invariants (comma-separated)", "immutable identity");
-        const invariants = invRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const multiplicity = await ctx.ui.input("Multiplicity (e.g., 'one-to-many', 'many-to-many', 'singleton')", "many");
-        const advRaw = await ctx.ui.input("Advantages (comma-separated)", "");
-        const advantages = advRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const limRaw = await ctx.ui.input("Limitations (comma-separated)", "");
-        const limitations = limRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const candidate: PrimitiveCandidate = {
-          name,
-          meaning: meaning || name,
-          operations,
-          invariants,
-          multiplicity: multiplicity || "many",
-          advantages,
-          limitations,
-        };
-
-        primState.candidates.push(candidate);
-
-        // Ask if this should be the selected primitive
-        const select = await ctx.ui.confirm(
-          "Select this as the PRIMITIVE?",
-          `"${name}" will become the canonical primitive`
-        );
-        if (select) {
-          primState.selected = candidate;
-          ctx.ui.notify(`✅ Primitive selected: "${name}"`, "info");
-        }
-
-        saveState();
-        const more = await ctx.ui.confirm("Add another candidate primitive?", "");
-        if (!more) addMore = false;
-      }
-
-      if (primState.selected) {
-        ctx.ui.notify(`✅ Primitive "${primState.selected.name}" selected and written to ${PRIM_FILE}`, "info");
-      } else if (primState.candidates.length > 0) {
-        ctx.ui.notify(
-          "Candidates recorded but none selected. Use /fleet:decision to escalate if needed.",
-          "info"
-        );
+  pi.registerCommand("fleet:multiplicity", {
+    description: "Define entity multiplicity (Phase 2)",
+    handler: async (_args, ctx) => {
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Entity name (blank to finish)", "");
+        if (!name) break;
+        const zero = (await ctx.ui.input("Zero allowed? (y/n)", "n")) === "y";
+        const one = (await ctx.ui.input("One allowed? (y/n)", "y")) === "y";
+        const many = (await ctx.ui.input("Many allowed? (y/n)", "n")) === "y";
+        const nested = (await ctx.ui.input("Nested? (y/n)", "n")) === "y";
+        const shared = (await ctx.ui.input("Shared? (y/n)", "n")) === "y";
+        const res = defineEntity(state, { name, zeroAllowed: zero, oneAllowed: one, manyAllowed: many, nested, shared });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
     },
   });
 
-  // ─── Command: fleet:multiplicity ───────────────────────────────────────
+  pi.registerTool({
+    name: "fleet_propose_primitive",
+    label: "Propose Primitive",
+    description:
+      "Propose a candidate abstraction the whole system could reduce to. Record two or three genuine alternatives with their tradeoffs — do not propose one and select it immediately.",
+    parameters: Type.Object({
+      name: Type.String(),
+      meaning: Type.String({ description: "What this abstraction means in one or two sentences" }),
+      operations: Type.Optional(Type.Array(Type.String())),
+      invariants: Type.Optional(Type.Array(Type.String())),
+      advantages: Type.Optional(Type.Array(Type.String())),
+      limitations: Type.Optional(Type.Array(Type.String())),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = proposePrimitive(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
 
-  pi.registerCommand("fleet:multiplicity", {
-    description: "Define entity multiplicity (Phase 2) — zero/one/many/nested/shared",
-    handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
+  pi.registerTool({
+    name: "fleet_select_primitive",
+    label: "Select Primitive",
+    description:
+      "Select one proposed primitive as the system's core abstraction. Only call this after the alternatives have been recorded — Phase 7 verification requires operations, invariants, and limitations to be stated.",
+    parameters: Type.Object({ name: Type.String({ description: "Name of a previously proposed candidate" }) }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = selectPrimitive(loadState(), (params as any).name);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
 
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input("Entity name (e.g., 'User', 'Document', 'Project') — or blank to stop", "");
-        if (!name) { addMore = false; break; }
-
-        const zero = await ctx.ui.confirm("Zero allowed?", "");
-        const one = await ctx.ui.confirm("One allowed?", "");
-        const many = await ctx.ui.confirm("Many allowed?", "");
-        const nested = await ctx.ui.confirm("Nested allowed?", "");
-        const shared = await ctx.ui.confirm("Shared allowed?", "");
-        const notes = await ctx.ui.input("Notes", "");
-
-        primState.entities.push({
-          name,
-          zeroAllowed: zero,
-          oneAllowed: one,
-          manyAllowed: many,
-          nested: nested,
-          shared: shared,
-          notes: notes || "",
-        });
-
-        saveState();
-        ctx.ui.notify(`📐 Entity "${name}" multiplicity recorded`, "info");
-
-        const more = await ctx.ui.confirm("Add another entity?", "");
-        if (!more) addMore = false;
-      }
-
-      saveState();
-      ctx.ui.notify(`✅ ${primState.entities.length} entities documented in ${PRIM_FILE}`, "info");
+  pi.registerTool({
+    name: "fleet_define_entity",
+    label: "Define Entity",
+    description:
+      "Declare cardinality for a domain entity: whether zero, one, or many instances are permitted, and whether it can nest or be shared. At least one of zero/one/many must be permitted.",
+    parameters: Type.Object({
+      name: Type.String(),
+      zeroAllowed: Type.Optional(Type.Boolean()),
+      oneAllowed: Type.Optional(Type.Boolean()),
+      manyAllowed: Type.Optional(Type.Boolean()),
+      nested: Type.Optional(Type.Boolean()),
+      shared: Type.Optional(Type.Boolean()),
+      notes: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = defineEntity(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
     },
   });
 }

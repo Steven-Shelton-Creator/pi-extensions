@@ -3,3 +3,9 @@
 Thumbs.db
 *.swp
 *.swo
+
+# Node
+node_modules/
+
+# Fleet workspace output
+architecture/

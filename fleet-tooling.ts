@@ -1,83 +1,128 @@
 /**
- * fleet-tooling :: [MACRO] Phase 6 — Tooling & Simulation Planning
+ * fleet-tooling :: Phase 6 — Test Harnesses & Tooling
  *
- * Makes every important contract independently observable and testable.
- * For each module/interface, defines the minimal executable harness needed
- * so downstream agents test without the full application.
+ * Declares how each module or contract will actually be proven. A module with no
+ * harness is an assumption, and Phase 11 integration is where assumptions bill.
  *
- * Gate: Phase 5 (DEPENDENCIES + EXTENSIONS) must be complete.
+ * Commands: /fleet:tooling /fleet:harness
+ * Tools:    fleet_add_harness, fleet_list_tooling
  *
- * /fleet:tooling   — define test harnesses and tooling for modules
- * /fleet:harness   — define a specific test harness
+ * Usage: pi -e extensions/fleet-tooling.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  TOOL_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-type HarnessType =
-  | "minimal-test-app"
-  | "inspector"
-  | "logger"
-  | "recorder"
-  | "playback"
-  | "mock-producer"
-  | "mock-consumer"
-  | "simulator"
-  | "visualizer"
-  | "scripting-harness"
-  | "compatibility-test";
+export const HARNESS_TYPES = [
+  "unit", "integration", "contract", "end-to-end",
+  "property", "fuzz", "benchmark", "load",
+] as const;
 
-interface ToolingItem {
+export type HarnessType = (typeof HARNESS_TYPES)[number];
+
+export interface ToolingItem {
   id: string;
   name: string;
   harnessType: HarnessType;
-  targetModule: string;   // MOD-xxx or FMT-xxx
+  targetModule: string;
   description: string;
   language: string;
   dependencies: string[];
   status: "planned" | "implemented" | "obsolete";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Operations ──────────────────────────────────────────────────────────────
 
-const ARCH_DIR = "architecture";
-const TOOL_FILE = "09_TOOLING_PLAN.md";
-
-function cwd(): string { return process.cwd(); }
-function archPath(...parts: string[]): string { return join(cwd(), ARCH_DIR, ...parts); }
-function ensureArchDir() { const p = archPath(); if (!existsSync(p)) mkdirSync(p, { recursive: true }); }
-
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) { try { return JSON.parse(readFileSync(jsonPath, "utf8")); } catch { return null; } }
-  return null;
+function items(state: FleetState): ToolingItem[] {
+  if (!state.tooling) state.tooling = [];
+  return state.tooling as ToolingItem[];
 }
 
-function writeToolingFile(items: ToolingItem[]) {
+export function addHarness(state: FleetState, input: Partial<ToolingItem>) {
+  const list = items(state);
+  if (!input.name?.trim()) return { ok: false, message: "name is required" };
+  if (!input.targetModule?.trim()) {
+    return { ok: false, message: "targetModule is required — a harness that targets nothing proves nothing" };
+  }
+  if (!HARNESS_TYPES.includes(input.harnessType as any)) {
+    return { ok: false, message: `harnessType must be one of: ${HARNESS_TYPES.join(", ")}` };
+  }
+
+  const id = input.id?.trim() || `TOL-${String(list.length + 1).padStart(3, "0")}`;
+  if (list.some((t) => t.id === id)) return { ok: false, message: `${id} already exists` };
+
+  const item: ToolingItem = {
+    id,
+    name: input.name.trim(),
+    harnessType: input.harnessType as HarnessType,
+    targetModule: input.targetModule.trim(),
+    description: input.description?.trim() || "",
+    language: input.language?.trim() || "",
+    dependencies: input.dependencies || [],
+    status: "planned",
+  };
+  list.push(item);
+  saveState(state);
+  writeToolingFile(state);
+  audit(`harness ${id} ${item.harnessType} -> ${item.targetModule}`, state);
+  return { ok: true, message: `${id} ${item.harnessType} harness for ${item.targetModule}` };
+}
+
+/** Modules declared in Phase 4 that have no harness yet. */
+export function untestedTargets(state: FleetState): string[] {
+  const covered = new Set(items(state).map((t) => t.targetModule));
+  return (state.modules || []).map((m: any) => m.id).filter((id: string) => !covered.has(id));
+}
+
+// ─── Writer ──────────────────────────────────────────────────────────────────
+
+function writeToolingFile(state: FleetState) {
   ensureArchDir();
-  if (items.length === 0) {
-    writeFileSync(archPath(TOOL_FILE), "# Tooling Plan\n\n*No tooling planned yet.*\n", "utf8");
+  const list = items(state);
+  if (list.length === 0) {
+    writeFileSync(archPath(TOOL_FILE), "# Tooling Plan\n\n*No harnesses planned yet.*\n", "utf8");
     return;
   }
-  const lines = ["# Tooling Plan", "", `*Generated by fleet-tooling · ${new Date().toISOString()}*`, ""];
-  lines.push("| ID | Name | Type | Target | Status | Language |");
-  lines.push("|---|---|---|---|---|---|");
-  for (const t of items) {
-    lines.push(`| ${t.id} | ${t.name} | ${t.harnessType} | ${t.targetModule} | ${t.status} | ${t.language} |`);
+  const lines = [
+    "# Tooling Plan",
+    "",
+    `*Generated by fleet-tooling · ${new Date().toISOString()}*`,
+    "",
+    "| ID | Name | Type | Target | Language | Status |",
+    "|---|---|---|---|---|---|",
+  ];
+  for (const t of list) {
+    lines.push(`| ${t.id} | ${t.name} | ${t.harnessType} | ${t.targetModule} | ${t.language || "—"} | ${t.status} |`);
   }
-  lines.push("");
-  for (const t of items) {
-    lines.push(`### ${t.id} — ${t.name}`);
-    lines.push(`**Type:** ${t.harnessType}  **Target:** ${t.targetModule}  **Status:** ${t.status}`);
-    lines.push(`**Language:** ${t.language}`);
-    if (t.dependencies.length) lines.push(`**Dependencies:** ${t.dependencies.join(", ")}`);
+  const missing = untestedTargets(state);
+  lines.push("", "---", "");
+  if (missing.length > 0) {
+    lines.push("## Modules Without a Harness", "");
+    lines.push("These are defined but unproven. Phase 11 will surface them.", "");
+    for (const id of missing) lines.push(`- ${id}`);
     lines.push("");
-    lines.push(t.description);
-    lines.push("---");
+  }
+  for (const t of list) {
+    lines.push(`## ${t.id} — ${t.name}`);
     lines.push("");
+    lines.push(`**Harness Type:** ${t.harnessType}  **Target:** ${t.targetModule}  **Status:** ${t.status}`);
+    lines.push("");
+    lines.push(t.description || "_unspecified_");
+    lines.push("");
+    lines.push(`**Language:** ${t.language || "—"}`);
+    lines.push("");
+    lines.push("### Dependencies");
+    if (t.dependencies.length) for (const d of t.dependencies) lines.push(`- ${d}`);
+    else lines.push("_none_");
+    lines.push("");
+    lines.push("---", "");
   }
   writeFileSync(archPath(TOOL_FILE), lines.join("\n"), "utf8");
 }
@@ -85,127 +130,96 @@ function writeToolingFile(items: ToolingItem[]) {
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let items: ToolingItem[] = [];
-
-  pi.on("session_start", async () => {
-    const statePath = archPath("tool-state.json");
-    if (existsSync(statePath)) {
-      try { const s = JSON.parse(readFileSync(statePath, "utf8")); items = s.items || []; }
-      catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state?.job?.objective) { ctx.ui.notify("No job initialized.", "warning"); return false; }
-    if (!fleet.state.phaseGates?.[5]) { ctx.ui.notify("Phase 5 (DEPENDENCIES + EXTENSIONS) not complete.", "warning"); return false; }
-    return true;
-  }
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(archPath("tool-state.json"), JSON.stringify({ items }, null, 2), "utf8");
-    writeToolingFile(items);
-  }
-
-  // ─── Command: fleet:tooling ───────────────────────────────────────────
 
   pi.registerCommand("fleet:tooling", {
     description: "Define test harnesses and tooling (Phase 6)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify(
-        "Tooling plan: every important contract needs an independent means of being exercised. Downstream agents should test without the full application.",
-        "info"
-      );
-
-      const targetModule = await ctx.ui.input("Target module or interface (MOD-xxx or FMT-xxx)", "");
-      if (!targetModule) { ctx.ui.notify("Cancelled.", "info"); return; }
-
-      // Show harness types as numbered list
-      const types: HarnessType[] = [
-        "minimal-test-app", "inspector", "logger", "recorder", "playback",
-        "mock-producer", "mock-consumer", "simulator", "visualizer",
-        "scripting-harness", "compatibility-test"
-      ];
-      const typeLabels = types.map((t) => t.replace(/-/g, " "));
-
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input(`Tooling item name for ${targetModule} — or blank to stop`, "");
-        if (!name) { addMore = false; break; }
-
-        const typeIdxRaw = await ctx.ui.select("Harness type", typeLabels.map((l, i) => ({ label: l, value: String(i) })));
-        const harnessType = types[parseInt(typeIdxRaw || "0")];
-
-        const description = await ctx.ui.input("Description — what does this harness validate?", "");
-        const language = await ctx.ui.input("Implementation language", "python");
-        const depsRaw = await ctx.ui.input("Dependencies (comma-separated)", "");
-        const dependencies = depsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        items.push({
-          id: `TOOL-${String(items.length + 1).padStart(3, "0")}`,
-          name,
-          harnessType,
-          targetModule,
-          description: description || name,
-          language: language || "python",
-          dependencies,
-          status: "planned",
-        });
-        saveState();
-        ctx.ui.notify(`🛠️  Added ${harnessType} for ${targetModule}`, "info");
-
-        const more = await ctx.ui.confirm("Add another tooling item for this target?", "");
-        if (!more) addMore = false;
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Harness name (blank to finish)", "");
+        if (!name) break;
+        const type = await ctx.ui.input(`Type (${HARNESS_TYPES.join("/")})`, "unit");
+        const target = await ctx.ui.input("Target (MOD or FMT id)", "");
+        const desc = await ctx.ui.input("Description", "");
+        const res = addHarness(state, { name, harnessType: type as any, targetModule: target, description: desc });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
-
-      saveState();
-      ctx.ui.notify(`✅ ${items.length} tooling items planned for ${targetModule}`, "info");
+      const missing = untestedTargets(state);
+      if (missing.length > 0) {
+        ctx.ui.notify(`Modules without a harness: ${missing.join(", ")}`, "warning");
+      }
     },
   });
 
-  // ─── Command: fleet:harness ────────────────────────────────────────────
-
   pi.registerCommand("fleet:harness", {
-    description: "Quick-add a test harness (usage: /fleet:harness <target> <type> <name>)",
+    description: "Quick-add a harness (/fleet:harness <target> <type> <name>)",
     handler: async (args, ctx) => {
-      if (!checkGate(ctx)) return;
-
       const parts = (args || "").trim().split(/\s+/);
       if (parts.length < 3) {
-        ctx.ui.notify("Usage: /fleet:harness <MOD/FMT-xxx> <type> <name>", "warning");
+        ctx.ui.notify(`Usage: /fleet:harness <target> <type> <name>\nTypes: ${HARNESS_TYPES.join(", ")}`, "warning");
         return;
       }
-
-      const target = parts[0];
-      const typeRaw = parts[1].toLowerCase().replace(/-/g, "-");
-      const name = parts.slice(2).join(" ");
-
-      const validTypes: HarnessType[] = [
-        "minimal-test-app", "inspector", "logger", "recorder", "playback",
-        "mock-producer", "mock-consumer", "simulator", "visualizer",
-        "scripting-harness", "compatibility-test"
-      ];
-
-      let harnessType: HarnessType = "minimal-test-app";
-      for (const t of validTypes) {
-        if (typeRaw === t || typeRaw === t.replace(/-/g, "")) { harnessType = t; break; }
-      }
-
-      items.push({
-        id: `TOOL-${String(items.length + 1).padStart(3, "0")}`,
-        name,
-        harnessType,
-        targetModule: target,
-        description: `${harnessType} for ${target}`,
-        language: "python",
-        dependencies: [],
-        status: "planned",
+      const res = addHarness(loadState(), {
+        targetModule: parts[0], harnessType: parts[1] as any, name: parts.slice(2).join(" "),
       });
-      saveState();
-      ctx.ui.notify(`🛠️  ${harnessType} "${name}" for ${target}`, "info");
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_add_harness",
+    label: "Add Test Harness",
+    description:
+      "Declare a test harness for a module or contract. Use fleet_untested_targets to find what is still unproven.",
+    parameters: Type.Object({
+      name: Type.String(),
+      targetModule: Type.String({ description: "MOD- or FMT- id under test" }),
+      harnessType: Type.Union(HARNESS_TYPES.map((t) => Type.Literal(t) as any), {
+        description: HARNESS_TYPES.join(" | "),
+      }),
+      description: Type.Optional(Type.String()),
+      language: Type.Optional(Type.String()),
+      dependencies: Type.Optional(Type.Array(Type.String())),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addHarness(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_untested_targets",
+    label: "Untested Targets",
+    description: "List modules that have been defined but have no harness planned against them.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      const state = loadState();
+      const missing = untestedTargets(state);
+      const text = missing.length === 0
+        ? "Every defined module has a harness."
+        : `Modules without a harness (${missing.length}): ${missing.join(", ")}`;
+      return { content: [{ type: "text", text }], details: { missing } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_list_tooling",
+    label: "List Tooling",
+    description: "List every planned or implemented test harness.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      const list = items(loadState());
+      const text = list.length === 0
+        ? "No harnesses planned."
+        : list.map((t) => `${t.id} — ${t.name} [${t.harnessType}] → ${t.targetModule} (${t.status})`).join("\n");
+      return { content: [{ type: "text", text }], details: { count: list.length } };
     },
   });
 }

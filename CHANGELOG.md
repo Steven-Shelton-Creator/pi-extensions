@@ -5,23 +5,29 @@ All notable changes to the Macro Architecture Fleet are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**Release status.** Nothing has been merged to `main`. Versions below are
-named by intent, not by merge:
+**Release status.** All three versions are on `main`. Commits are the current
+hashes; branch names are where each version was developed, and those branches
+still exist.
 
-| Version | Branch | Commit | State |
+| Version | On `main` | Developed on | Landed via |
 |---|---|---|---|
-| 0.1.0 | `main` | `926ecc9` | on `main` |
-| 0.2.0 | `feat/enforced-phase-machine` | `39048ee` | branch only, unreleased |
-| 0.3.0 | `feat/gate-hardening` | `0bb5fff`, `7006a71` | branch only, unreleased |
+| 0.1.0 | `926ecc9` | `main` | direct push (baseline) |
+| 0.2.0 | `a1697ad` | `feat/enforced-phase-machine` | merge commit — PR #1 |
+| 0.3.0 | `ce1da26` | `feat/gate-hardening` | direct push |
 
-Merge order is enforced: 0.2.0 first, then 0.3.0. The 0.3.0 tokenizer fixes
-only exist because the 0.3.0 gate depends on them, so the two cannot be split.
+`main` is at `ce1da26`, clean, with 181 assertions passing.
+
+Two notes on history. PR #1 merged as a no-content merge commit — `a1697ad`'s
+tree is byte-identical to `a10c5fb`, its parent — so 0.3.0 could not fast-forward
+onto it and was rebased instead. Its feature commits are therefore `57e44d0` and
+`d6b4d05` on `main`, not the `0bb5fff` and `7006a71` on their branch. The rebase
+changed history, not content: `git diff` before and after was empty.
 
 ---
 
-## [0.3.0] — UNRELEASED
+## [0.3.0] — 2026-10-03
 
-**Branch:** `feat/gate-hardening` · **Commits:** `0bb5fff`, `7006a71`
+**On `main`:** `ce1da26` (tip) · **Feature commits:** `57e44d0`, `d6b4d05`
 **Tests:** 181 assertions, 0 failures (up from 107)
 
 Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.
@@ -131,10 +137,9 @@ probes (mis-flagged pipe destination, unhandled command substitution).
 
 ---
 
-## [0.2.0] — UNRELEASED (2026-10-03)
+## [0.2.0] — 2026-10-03
 
-**Branch:** `feat/enforced-phase-machine` · **Commit:** `39048ee`
-**State:** on-branch only. `main` is still at 0.1.0.
+**On `main`:** `a1697ad` (merge commit, PR #1) · **Feature commit:** `39048ee`
 
 The rewrite that made the fleet's claims true. The previous release documented a
 phase machine, a decision queue, and an architecture verifier. None of the three
@@ -332,6 +337,6 @@ Recorded retrospectively; all were addressed in 0.2.0 except where noted.
 - No LICENSE file despite an MIT claim in the README.
 - No tests.
 
-[0.3.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/a10c5fb...feat/gate-hardening
-[0.2.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/926ecc9...39048ee
+[0.3.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/926ecc9...ce1da26
+[0.2.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/926ecc9...a1697ad
 [0.1.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/releases/tag/db22a80

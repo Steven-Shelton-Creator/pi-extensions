@@ -5,11 +5,23 @@ All notable changes to the Macro Architecture Fleet are recorded here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+**Release status.** Nothing has been merged to `main`. Versions below are
+named by intent, not by merge:
+
+| Version | Branch | Commit | State |
+|---|---|---|---|
+| 0.1.0 | `main` | `926ecc9` | on `main` |
+| 0.2.0 | `feat/enforced-phase-machine` | `39048ee` | branch only, unreleased |
+| 0.3.0 | `feat/gate-hardening` | `0bb5fff`, `7006a71` | branch only, unreleased |
+
+Merge order is enforced: 0.2.0 first, then 0.3.0. The 0.3.0 tokenizer fixes
+only exist because the 0.3.0 gate depends on them, so the two cannot be split.
+
 ---
 
-## [Unreleased] — 0.3.0 candidate
+## [0.3.0] — UNRELEASED
 
-**Branch:** `feat/gate-hardening` · **Parent:** `a10c5fb`
+**Branch:** `feat/gate-hardening` · **Commits:** `0bb5fff`, `7006a71`
 **Spec:** SPEC.md (reviewed — see REVIEW.md) · **Changes:** CHANGES.md
 **Tests:** 181 assertions, 0 failures (up from 107)
 
@@ -120,9 +132,10 @@ probes (mis-flagged pipe destination, unhandled command substitution).
 
 ---
 
-## [0.2.0] — 2026-10-03
+## [0.2.0] — UNRELEASED (2026-10-03)
 
 **Branch:** `feat/enforced-phase-machine` · **Commit:** `39048ee`
+**State:** on-branch only. `main` is still at 0.1.0.
 
 The rewrite that made the fleet's claims true. The previous release documented a
 phase machine, a decision queue, and an architecture verifier. None of the three
@@ -320,6 +333,6 @@ Recorded retrospectively; all were addressed in 0.2.0 except where noted.
 - No LICENSE file despite an MIT claim in the README.
 - No tests.
 
-[Unreleased]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/a10c5fb...feat/gate-hardening
+[0.3.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/a10c5fb...feat/gate-hardening
 [0.2.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/compare/926ecc9...39048ee
 [0.1.0]: https://github.com/Steven-Shelton-Creator/pi-extensions/releases/tag/db22a80

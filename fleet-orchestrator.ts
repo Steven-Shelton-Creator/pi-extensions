@@ -27,7 +27,8 @@ import {
   JOB_FILE, DECISION_FILE, AUDIT_FILE, OVERRIDE_FILE,
   archPath, ensureArchDir,
   loadState, saveState, audit, emptyState,
-  gateForPhase, artifactStatus, installEnforcement, phaseBrief,
+  gateForPhase, artifactStatus, installEnforcement, phaseBrief, aborted, ABORTED_RESULT,
+  gateCoverage, GATE_CONFIG_PATH,
 } from "./fleet-core.ts";
 import type { FleetState, Decision } from "./fleet-core.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -125,6 +126,18 @@ function advancePhase(state: FleetState, target: number): { ok: boolean; message
         ok: false,
         message: "Contracts are frozen; rewind is blocked. Open a decision instead.",
       };
+    }
+
+    // D3: a verdict obtained before the rewind no longer describes reality, and
+    // gateForPhase accepts a PASS from any previous run. Clear it so the Phase 9
+    // gate cannot be satisfied by a stale result. Not configurable — a switch
+    // that reopens a High defect is not a switch.
+    const verdict = state.verification;
+    if (verdict && typeof verdict.phase === "number" && target <= verdict.phase) {
+      const had = verdict.summary;
+      const at = verdict.phase;
+      state.verification = null;
+      audit(`rewind to phase ${target} invalidated the Phase ${at} verdict (was ${had})`);
     }
   }
 
@@ -351,6 +364,31 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("fleet:gate", {
+    description: "Report what the write gate enforces — and what it does not",
+    handler: async (_args, ctx) => {
+      const cov = gateCoverage();
+      const lines = [
+        `🛡️ Gate: ${cov.enabled ? "ENABLED" : "DISABLED"}`,
+        `  Config: ${cov.configPath}`,
+        `  Session guards: ${cov.sessionGuards ? "on" : "off"}`,
+        "",
+        "  Enforced:",
+        ...cov.enforced.map((e) => `    ✅ ${e}`),
+        "",
+        "  NOT enforced — the gate cannot see these:",
+        ...cov.unenforced.map((u) => `    ⚠️  ${u}`),
+      ];
+      if (Object.keys(cov.extraMutatingCommands).length > 0) {
+        lines.push("", "  Extra mutating commands:");
+        for (const [cmd, subs] of Object.entries(cov.extraMutatingCommands)) {
+          lines.push(`    · ${cmd} ${subs.join("|")}`);
+        }
+      }
+      ctx.ui.notify(lines.join("\n"), cov.enabled ? "info" : "warning");
+    },
+  });
+
   pi.registerCommand("fleet:audit", {
     description: "Replay the fleet enforcement log",
     handler: async (_args, ctx) => {
@@ -389,12 +427,36 @@ export default function (pi: ExtensionAPI) {
   // ─── Tools ─────────────────────────────────────────────────────────────────
 
   pi.registerTool({
+    name: "fleet_gate_coverage",
+    label: "Gate Coverage",
+    description:
+      "Report exactly what the phase gate enforces and what it cannot reach. Call this before relying on the gate — the unenforced list is the honest boundary of the guarantee, and includes writes via MCP servers and by subprocesses spawned by other extensions.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
+      const cov = gateCoverage();
+      const text = [
+        `Gate: ${cov.enabled ? "ENABLED" : "DISABLED"} (config ${cov.configPath})`,
+        `Session guards: ${cov.sessionGuards ? "on" : "off"}`,
+        "",
+        "Enforced:",
+        ...cov.enforced.map((e) => `  + ${e}`),
+        "",
+        "Not enforced:",
+        ...cov.unenforced.map((u) => `  ! ${u}`),
+      ].join("\n");
+      return { content: [{ type: "text", text }], details: { ...cov } };
+    },
+  });
+
+  pi.registerTool({
     name: "fleet_status",
     label: "Fleet Status",
     description:
       "Read the current Macro Architecture Fleet state: phase, artifact presence, decision queue, and what blocks the next phase. Call this before acting so you do not guess where the job is.",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const state = loadState();
       const text = state.job.objective ? statusReport(state) : "No job initialized.";
       ctx.ui.notify(state.job.objective ? `[fleet] status` : `[fleet] no job`, "info");
@@ -410,7 +472,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       phase: Type.Optional(Type.Number({ description: "Target phase 0-11. Omit to advance by one." })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const state = loadState();
       const target = (params as any).phase ?? state.currentPhase + 1;
       const res = advancePhase(state, target);
@@ -432,7 +495,8 @@ export default function (pi: ExtensionAPI) {
       topic: Type.String({ description: "What must be decided" }),
       reason: Type.Optional(Type.String({ description: "What forced the decision" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const p = params as any;
       const state = loadState();
       const res = recordDecision(state, p.id, p.topic);
@@ -455,7 +519,8 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Decision id" }),
       option: Type.String({ description: "The selected option, verbatim from the user" }),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const p = params as any;
       const state = loadState();
       const res = resolveDecision(state, p.id, p.option);
@@ -473,7 +538,8 @@ export default function (pi: ExtensionAPI) {
       contractId: Type.String({ description: "Contract identifier, e.g. core-api" }),
       version: Type.Optional(Type.String({ description: "Contract version. Defaults to 1." })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const p = params as any;
       const state = loadState();
       const res = freezeContracts(state, p.contractId, p.version || "1");

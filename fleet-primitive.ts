@@ -13,8 +13,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
-  PRIM_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
-} from "./fleet-core.ts";
+  PRIM_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief, aborted, ABORTED_RESULT } from "./fleet-core.ts";
 import type { FleetState } from "./fleet-core.ts";
 import { writeFileSync } from "node:fs";
 
@@ -246,7 +245,8 @@ export default function (pi: ExtensionAPI) {
       advantages: Type.Optional(Type.Array(Type.String())),
       limitations: Type.Optional(Type.Array(Type.String())),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = proposePrimitive(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
@@ -259,7 +259,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Select one proposed primitive as the system's core abstraction. Only call this after the alternatives have been recorded — Phase 7 verification requires operations, invariants, and limitations to be stated.",
     parameters: Type.Object({ name: Type.String({ description: "Name of a previously proposed candidate" }) }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = selectPrimitive(loadState(), (params as any).name);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
@@ -280,7 +281,8 @@ export default function (pi: ExtensionAPI) {
       shared: Type.Optional(Type.Boolean()),
       notes: Type.Optional(Type.String()),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = defineEntity(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };

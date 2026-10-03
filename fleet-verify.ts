@@ -32,10 +32,88 @@ import { Type } from "@sinclair/typebox";
 import {
   PHASES, PRIM_FILE, FMT_FILE, INT_FILE, MOD_FILE, DEP_FILE, VER_FILE,
   archPath, ensureArchDir, loadState, saveState, audit,
-  readRegistry, phaseBrief,
+  readRegistry, phaseBrief, aborted, ABORTED_RESULT,
 } from "./fleet-core.ts";
 import type { ParsedBlock, FleetState } from "./fleet-core.ts";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+
+// ─── Drift (C2) ─────────────────────────────────────────────────────────────
+//
+// The store is the source of truth; the markdown is a rendered view. 0.3.0
+// verifies against the store and reports divergence between the two as its own
+// finding kind. A stale render is housekeeping, never a design defect, so it
+// never contributes to REJECT.
+
+export interface DriftFinding {
+  file: string;
+  kind: "missing" | "stale" | "unparsable";
+  detail: string;
+}
+
+function storeIds(items: any[] | undefined): Set<string> {
+  return new Set((items || []).map((x: any) => x.id).filter(Boolean));
+}
+
+function blockIds(blocks: ParsedBlock[] | null): Set<string> {
+  return new Set((blocks || []).map((b) => b.id));
+}
+
+/** Compare each rendered document against the store it is supposed to depict. */
+export function detectDrift(state: FleetState): DriftFinding[] {
+  const findings: DriftFinding[] = [];
+
+  const allContracts = state.contracts || [];
+  const interfaceContracts = allContracts.filter((c: any) => c.type === "interface" || c.type === "plugin");
+
+  const pairs: { file: string; store: Set<string> }[] = [
+    { file: FMT_FILE, store: storeIds(allContracts) },
+    // INT_FILE is deliberately a filtered rendering of the same registry — only
+    // interface and plugin contracts. Comparing it against the whole store would
+    // report every event/protocol contract as missing.
+    { file: INT_FILE, store: storeIds(interfaceContracts) },
+    { file: MOD_FILE, store: storeIds(state.modules) },
+    // DEP_FILE also renders the adapter table, so adapters are expected in it.
+    {
+      file: DEP_FILE,
+      store: new Set([...storeIds(state.dependencies), ...storeIds(state.adapters)]),
+    },
+  ];
+
+  for (const { file, store } of pairs) {
+    const path = archPath(file);
+    if (!existsSync(path)) {
+      if (store.size > 0) {
+        findings.push({
+          file,
+          kind: "missing",
+          detail: `${store.size} entr(ies) in the store have no rendered document`,
+        });
+      }
+      continue;
+    }
+    const blocks = readRegistry(file);
+    if (!blocks || blocks.length === 0) {
+      if (store.size > 0) {
+        findings.push({
+          file,
+          kind: "unparsable",
+          detail: "document exists but yields no registry blocks",
+        });
+      }
+      continue;
+    }
+    const rendered = blockIds(blocks);
+    const only = [...store].filter((id) => !rendered.has(id));
+    const extra = [...rendered].filter((id) => !store.has(id));
+    if (only.length > 0 || extra.length > 0) {
+      const bits: string[] = [];
+      if (only.length) bits.push(`in store but not rendered: ${only.join(", ")}`);
+      if (extra.length) bits.push(`rendered but not in store: ${extra.join(", ")}`);
+      findings.push({ file, kind: "stale", detail: bits.join("; ") });
+    }
+  }
+  return findings;
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -487,13 +565,93 @@ function verifyDependencies(
   });
 }
 
+// ─── Store → registry shape ──────────────────────────────────────────────────
+//
+// 0.2.0 built its input by re-parsing the rendered markdown. The store is the
+// source of truth, so these converters adapt the stored objects into the same
+// ParsedBlock shape the checks already consume — the verification logic is
+// unchanged, only where the data comes from.
+
+const yn = (b: boolean | undefined) => (b === false ? "❌" : "✅");
+
+function contractsToBlocks(contracts: any[], onlyInterfaces: boolean): ParsedBlock[] {
+  return contracts
+    .filter((c) => (onlyInterfaces ? c.type === "interface" || c.type === "plugin" : true))
+    .map((c) => ({
+      id: c.id,
+      name: c.name,
+      fields: {
+        Status: c.status,
+        Version: c.version,
+        Consumers: (c.consumers || []).join(", ") || "—",
+        Producers: (c.producers || []).join(", ") || "—",
+      },
+      // Emitted in the canonical form. The interface registry's inverted
+      // wording is still understood by extractFreedom, which is retained for
+      // stores imported from 0.1.0.
+      bullets: {
+        "Implementation Freedom": [
+          `Storage hidden: ${yn(c.hidesStorage)}`,
+          `Vendor hidden: ${yn(c.hidesVendor)}`,
+          `Platform hidden: ${yn(c.hidesPlatform)}`,
+          `Algorithm hidden: ${yn(c.hidesAlgorithm)}`,
+          `Alternative implementation: ${yn(c.alternativeImplementable)}`,
+        ],
+      },
+      sections: {
+        ...(onlyInterfaces ? { Contract: c.semantics || "" } : { Semantics: c.semantics || "" }),
+        Structure: c.structure || "",
+        Invariants: c.invariants || "",
+      },
+    }));
+}
+
+function modulesToBlocks(modules: any[]): ParsedBlock[] {
+  return modules.map((m) => ({
+    id: m.id,
+    name: m.name,
+    fields: {
+      Responsibility: m.responsibility || "",
+      Status: m.status,
+      Owner: m.implementationOwner || "",
+      Replaceable: m.replaceable ? "true" : "false",
+    },
+    bullets: {
+      Owns: m.owns || [],
+      "Does Not Own": m.doesNotOwn || [],
+      "Consumes Interfaces": m.consumesInterfaces || [],
+      "Exposes Interfaces": m.exposesInterfaces || [],
+      "Module Dependencies": (m.dependencies || []).filter((d: string) => d !== m.id),
+      Invariants: m.invariants || [],
+    },
+    sections: { "Test Strategy": m.testStrategy || "" },
+  }));
+}
+
+function depsToBlocks(deps: any[]): ParsedBlock[] {
+  return deps.map((d) => ({
+    id: d.id,
+    name: d.name,
+    fields: {
+      Category: d.category,
+      Version: d.version,
+      Risk: d.riskLevel,
+      "Adapter Required": d.adapterRequired ? "yes" : "no",
+      Adapter: d.adapterName || "",
+    },
+    bullets: { "Used By": d.usedBy || [] },
+    sections: { Notes: d.notes || "" },
+  }));
+}
+
 // ─── Orchestration ───────────────────────────────────────────────────────────
 
-export function runVerification(state: FleetState): { results: VerificationResult[]; summary: string } {
-  const formats = readRegistry(FMT_FILE) || [];
-  const interfaces = readRegistry(INT_FILE) || [];
-  const modules = readRegistry(MOD_FILE) || [];
-  const deps = readRegistry(DEP_FILE) || [];
+export function runVerification(state: FleetState): { results: VerificationResult[]; summary: string; drift: DriftFinding[] } {
+  const allContracts = state.contracts || [];
+  const formats = contractsToBlocks(allContracts, false);
+  const interfaces = contractsToBlocks(allContracts, true);
+  const modules = modulesToBlocks(state.modules || []);
+  const deps = depsToBlocks(state.dependencies || []);
   const adapters = (state.adapters as any[]) || [];
 
   const knownFormats = new Set([...formats, ...interfaces].map((b) => b.id));
@@ -545,9 +703,11 @@ export function runVerification(state: FleetState): { results: VerificationResul
   });
 
   // Contract-level implementation freedom, evaluated across the whole set.
-  const allContracts = [...formats, ...interfaces];
-  if (allContracts.length > 0) {
-    const leaky = allContracts.filter((c) => {
+  // `formats` already contains every contract (interface and plugin types
+  // included), so it is the set-wide view; `interfaces` is the same contracts
+  // re-rendered under the inverted labels and would double-count.
+  if (formats.length > 0) {
+    const leaky = formats.filter((c) => {
       const dims = new Map(extractFreedom(c).map((f) => [f.dim, f.ok]));
       const held = ["storage", "vendor", "platform"].filter((k) => dims.get(k) === true).length;
       return held < 2;
@@ -562,7 +722,7 @@ export function runVerification(state: FleetState): { results: VerificationResul
           passed: leaky.length === 0,
           detail:
             leaky.length === 0
-              ? `All ${allContracts.length} contract(s) withhold >=2 of storage/vendor/platform`
+              ? `All ${formats.length} contract(s) withhold >=2 of storage/vendor/platform`
               : `Leaky contracts: ${leaky.map((c) => c.id).join(", ")}`,
           severity: "high",
         },
@@ -577,13 +737,35 @@ export function runVerification(state: FleetState): { results: VerificationResul
   results.push(...verifyDependencies(deps, adapters, knownModules));
 
   const hasReject = results.some((r) => r.summary === "REJECT");
+  const drift = detectDrift(state);
+
+  // Drift is reported as its own target, severity low. It never contributes to
+  // REJECT — a stale render is a housekeeping problem, not a design defect.
+  if (drift.length > 0) {
+    results.push({
+      id: "VRFY-DRIFT",
+      target: "Store ↔ rendered documents",
+      targetType: "contract",
+      tests: drift.map((d) => ({
+        name: `${d.file} is ${d.kind}`,
+        passed: false,
+        detail: d.detail,
+        severity: "low" as const,
+      })),
+      summary: "PASS_WITH_CORRECTIONS",
+      findings: drift.map((d) => `${d.file} (${d.kind}): ${d.detail}`),
+      rejectedAssumptions: [],
+      requiredCorrections: [],
+    });
+  }
+
   const hasCorrections = results.some((r) => r.summary === "PASS_WITH_CORRECTIONS");
   const summary = hasReject ? "REJECT" : hasCorrections ? "PASS_WITH_CORRECTIONS" : "PASS";
 
-  return { results, summary };
+  return { results, summary, drift };
 }
 
-function writeVerificationFile(results: VerificationResult[], summary: string) {
+function writeVerificationFile(results: VerificationResult[], summary: string, drift: DriftFinding[] = []) {
   ensureArchDir();
   const lines = [
     "# Verification Report",
@@ -596,6 +778,12 @@ function writeVerificationFile(results: VerificationResult[], summary: string) {
   const total = results.reduce((n, r) => n + r.tests.length, 0);
   const failed = results.reduce((n, r) => n + r.tests.filter((t) => !t.passed).length, 0);
   lines.push(`${results.length} target(s), ${total} test(s), ${failed} failure(s).`, "");
+  if (drift.length > 0) {
+    lines.push("## Store ↔ document drift", "");
+    lines.push("The store is authoritative. These rendered documents do not match it.", "");
+    for (const d of drift) lines.push(`- **${d.file}** (${d.kind}) — ${d.detail}`);
+    lines.push("");
+  }
 
   for (const r of results) {
     lines.push(`## ${r.id} — ${r.target}`, "");
@@ -616,7 +804,7 @@ function writeVerificationFile(results: VerificationResult[], summary: string) {
   writeFileSync(archPath(VER_FILE), lines.join("\n"), "utf8");
 }
 
-function summarise(results: VerificationResult[], summary: string): string {
+function summarise(results: VerificationResult[], summary: string, drift: DriftFinding[] = []): string {
   const total = results.reduce((n, r) => n + r.tests.length, 0);
   const failed = results.reduce((n, r) => n + r.tests.filter((t) => !t.passed).length, 0);
   const high = results.reduce((n, r) => n + r.tests.filter((t) => !t.passed && t.severity === "high").length, 0);
@@ -636,6 +824,11 @@ function summarise(results: VerificationResult[], summary: string): string {
   if (summary === "REJECT") {
     lines.push("");
     lines.push("  Phase 9 is blocked until the high-severity findings above are fixed and re-verified.");
+  }
+  if (drift.length > 0) {
+    lines.push("");
+    lines.push("  Store ↔ document drift (housekeeping, never blocks):");
+    for (const d of drift) lines.push(`    · ${d.file} (${d.kind}): ${d.detail}`);
   }
   return lines.join("\n");
 }
@@ -661,12 +854,17 @@ export default function (pi: ExtensionAPI) {
     description: "Run structural architecture verification (Phase 7)",
     handler: async (_args, ctx) => {
       const state = loadState();
-      const { results, summary } = runVerification(state);
-      state.verification = { ranAt: new Date().toISOString(), summary, results };
+      const { results, summary, drift } = runVerification(state);
+      state.verification = {
+        ranAt: new Date().toISOString(),
+        phase: state.currentPhase,
+        summary,
+        results,
+      };
       saveState(state);
-      writeVerificationFile(results, summary);
+      writeVerificationFile(results, summary, drift);
       audit(`verification ${summary}`, state);
-      ctx.ui.notify(summarise(results, summary), summary === "REJECT" ? "error" : "info");
+      ctx.ui.notify(summarise(results, summary, drift), summary === "REJECT" ? "error" : "info");
     },
   });
 
@@ -695,18 +893,24 @@ export default function (pi: ExtensionAPI) {
     description:
       "Run structural verification across every registry: cross-reference integrity (FMT-/MOD-/DEP-/EXT- ids must resolve), module dependency cycle detection, implementation-freedom enforcement on contracts, and boundary/test-strategy checks on modules. Returns a PASS / PASS_WITH_CORRECTIONS / REJECT verdict. REJECT blocks the move to contract freeze.",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
+    async execute(_id, _params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const state = loadState();
-      const { results, summary } = runVerification(state);
-      state.verification = { ranAt: new Date().toISOString(), summary, results };
+      const { results, summary, drift } = runVerification(state);
+      state.verification = {
+        ranAt: new Date().toISOString(),
+        phase: state.currentPhase,
+        summary,
+        results,
+      };
       saveState(state);
-      writeVerificationFile(results, summary);
+      writeVerificationFile(results, summary, drift);
       audit(`verification ${summary}`, state);
-      const text = summarise(results, summary);
+      const text = summarise(results, summary, drift);
       ctx.ui.notify(`[fleet] verification ${summary}`, summary === "REJECT" ? "error" : "info");
       return {
         content: [{ type: "text", text }],
-        details: { summary, results },
+        details: { summary, results, drift },
       };
     },
   });

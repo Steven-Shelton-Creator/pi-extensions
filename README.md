@@ -148,7 +148,10 @@ Markdown in `architecture/` is a rendered view of the store, not the source of t
 node test/smoke.mjs
 ```
 
-107 assertions covering the write gate, phase gates, freeze immutability, the decision queue, and the verifier — including that a dangling reference, a dependency cycle, and a leaky contract each produce `REJECT` and each block the advance to Phase 8.
+163 assertions covering the write gate, phase gates, freeze immutability, the decision queue, the shell classifier (including six documented false positives that must *not* block), gate coverage, abort handling, session guards, rewind invalidation, and drift detection.
+
+The suite catches dangling references, dependency cycles, and leaky contracts
+each producing `REJECT` and each blocking the advance to Phase 8.
 
 The test runs against a temporary workspace and needs `@sinclair/typebox` and `@earendil-works/pi-coding-agent` resolvable; under pi both are present.
 
@@ -156,12 +159,28 @@ The test runs against a temporary workspace and needs `@sinclair/typebox` and `@
 
 Worth stating plainly.
 
-- **Bash inspection is a regex list**, not a shell parser. It catches `git commit`, `rm -r`, package installs, and curl-pipe-shell. It will not catch a mutation expressed some other way.
-- **The write gate covers `write`, `edit`, `multi_edit`, `patch`, `bash`, `shell`.** A tool that writes to disk by another route — an MCP server, a subprocess spawned by another extension — is not covered.
-- **Verification reads the markdown**, so it validates what the writers emit. A hand-mangled registry that does not match the emitted shape may not parse into blocks and will be reported as missing rather than wrong.
+- **The session guard can trap a user.** `session_before_switch` cancels when decisions are unresolved at Phase 8 or later. The only exit is `sessionGuards: false` below. Accepted as a rough edge, not solved.
+- **The shell classifier is not a POSIX parser.** It handles quoting, the common separators, and output redirection; it does not expand variables, here-docs, or process substitution. Parse uncertainty fails open — except pipe-to-shell, which fails closed.
+- **The write gate covers the tools declared in `.pi/fleet-gate.json`**, default `write`, `edit`, `multi_edit`, `patch`, `bash`, `shell`. `fleet_gate_coverage` (or `/fleet:gate`) reports that list alongside what the gate *cannot* reach: writes by MCP servers, writes by subprocesses spawned by other extensions, and in-process mutation via `pi.exec`.
+- **Verification reads the store**, so it validates what the `fleet_*` tools wrote. Hand-edited documents are not silently trusted — they surface as drift at `low` severity, which never contributes to `REJECT`.
 - **Gate composition with other extensions is unverified.** If `damage-control` also blocks a call, whether both reasons surface or one wins was not tested here.
-- **Single process.** No subprocess isolation; a runaway `tool_result` is not interruptible, and the write gate does not abort running work.
-- **`/fleet:phase` permits rewinds** below Phase 9. Contracts frozen at Phase 9 or above block rewind.
+- **Single process.** Nothing in the fleet is long-running, so the abort signal prevents a half-finished write rather than interrupting work in flight.
+- **`/fleet:phase` permits rewinds** below Phase 9. A rewind clears any verification verdict produced at or above the phase rewound to.
+
+## Configuration
+
+Optional. Absent file ⇒ defaults, which reproduce the ungated behaviour of an earlier release.
+
+```json
+// .pi/fleet-gate.json
+{
+  "enabled": true,
+  "writeTools": ["write", "edit", "multi_edit", "patch", "apply_patch"],
+  "shellTools": ["bash", "shell"],
+  "extraMutatingCommands": { "terraform": ["apply", "destroy"] },
+  "sessionGuards": true
+}
+```
 
 ## License
 

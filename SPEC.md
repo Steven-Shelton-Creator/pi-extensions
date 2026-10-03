@@ -1,7 +1,7 @@
 # Spec — 0.3.0 gate hardening
 
 **Branch:** `feat/gate-hardening` · **Parent:** `feat/enforced-phase-machine` (`a10c5fb`)
-**Status:** REVIEWED — R1–R5 applied (see REVIEW.md). Ready to implement.
+**Status:** IMPLEMENTED — R1–R5 applied, all acceptance criteria met. 181 assertions passing (target was ≥150). See REVIEW.md for the review record and the three post-review findings.
 **Scope:** C1–C5 from CHANGES.md, plus defect D3.
 
 ---
@@ -107,6 +107,22 @@ anywhere in the line.
 - `/bin/GIT commit -m x` → **not** blocked (case-sensitive).
 - `git -c user.email=x commit` → blocked.
 - Malformed quoting never throws.
+
+> **Post-review additions (P1–P3).** Three cases the spec did not enumerate,
+> found by probing after implementation. The first two were reported by an
+> external reviewer; the third surfaced while investigating them. All now
+> enforced:
+>
+> - `echo $(git commit -m x)` → blocked. Command substitution, including
+>   backticks and nesting, is recursively tokenized and classified.
+> - `bash -c 'git commit -m x'` → blocked. An interpreter's `-c` payload is
+>   classified as an inline command.
+> - `cat s.sh | bash -s` → blocked. The `piped` flag marks the pipe
+>   *destination*, not the source; a pipe is remote execution when its
+>   destination is a shell interpreter, regardless of source or of flags.
+>
+> These are the same failure mode as R1: the fail-open default behaving exactly
+> as designed on input nobody wrote down.
 
 > **R4 applied — fail-open has an exception.** Parse uncertainty fails open,
 > *except* where a pipe's target is a shell interpreter, which fails closed.
@@ -294,6 +310,7 @@ what is not, and which MCP or non-tool write paths are outside the gate's reach.
 - **Session-guard tests** through `session_before_switch` / `session_before_fork`.
 - **Regression:** all 107 existing assertions must stay green.
 - Target: ≥ 150 assertions, `node test/smoke.mjs`, zero failures.
+  **Achieved: 181 assertions, 0 failures.**
 
 ## Risks
 

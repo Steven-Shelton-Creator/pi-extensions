@@ -4,6 +4,13 @@ Reviewed against `fleet-core.ts` @ `a10c5fb`, not against the spec's intentions.
 
 **Verdict: changes required.** Five amendments (R1–R5), one accepted risk (R6).
 
+> **Closure — all five applied.** R1–R5 were amended into SPEC.md before any
+> implementation was written. R6 was accepted as a documented rough edge. A
+> second review pass after implementation added three further findings, recorded
+> below as P1–P3; all three were also fixed. Total: 9 findings, 9 fixed, 0 open.
+> See SPEC.md for the amended acceptance criteria and CHANGELOG.md for what each
+> fix turned out to be in code.
+
 ---
 
 ## R1 — BLOCKER · `toLowerCase()` destroys Linux filenames
@@ -79,6 +86,35 @@ to switch sessions mid-decision has no route except editing config. Mitigation i
 `sessionGuards: false`, plus auditing every cancel so the block is visible rather
 than mysterious. Accepted as a known rough edge, documented in README
 limitations rather than solved.
+
+---
+
+## Second review pass — post-implementation (P1–P3)
+
+Raised by an external reviewer probing the merged C1, plus one found while
+investigating their probe. Recorded here rather than folded into R1–R5 because
+they were found after the spec was already amended — which is itself the point:
+a spec written in advance still cannot enumerate everything.
+
+| ID | Severity | Finding |
+|---|---|---|
+| **P1** | BLOCKER | Command substitution was never tokenized. `SEPARATORS` held no `$(`, backtick or `)`, so `echo $(git commit -m x)` produced one token and passed the gate. Six false negatives, plus `bash -c '<command>'`, where the quoted payload resolved to the interpreter's own name. |
+| **P2** | MAJOR | Pipe-to-shell required `argv.length === 1`, missing `cat s.sh \| bash -s`. The reviewer's own example (`curl … \| bash -s`) did not reproduce — see P3 for why it was already caught. |
+| **P3** | BLOCKER | **The `piped` flag marked the pipe source, not the destination.** The field was documented "target of a pipe" and the code did the opposite. This made the interpreter rule dead code, and the downloader rule worked only because it inspected the source. |
+
+P3 is the more serious of the two pipe findings and it was not in either
+reviewer's hypothesis. It is the same class as R1 and D3: the gate trusting a
+value that means the opposite of what its name claims.
+
+**All three fixed.** Substitution is recursively tokenized; `-c` payloads are
+classified; `piped` marks the destination and the downloader rule — which was
+compensating for the bug — was removed. 40 classifier cases now cover both the
+must-block and must-not-block sides. Negative cases confirmed unaffected:
+`echo "$(date)"`, `${HOME}`, `$5`, a pipe into `jq`, a pipe into `less`,
+`node -e`, `bash -c 'echo hello'`, quoted text, `/bin/GIT`.
+
+Still unenumerated, documented rather than assumed: here-docs, process
+substitution (`<(…)`, `>(…)`), and `bash script.sh` without `-c`.
 
 ---
 

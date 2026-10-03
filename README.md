@@ -148,7 +148,7 @@ Markdown in `architecture/` is a rendered view of the store, not the source of t
 node test/smoke.mjs
 ```
 
-163 assertions covering the write gate, phase gates, freeze immutability, the decision queue, the shell classifier (including six documented false positives that must *not* block), gate coverage, abort handling, session guards, rewind invalidation, and drift detection.
+181 assertions covering the write gate, phase gates, freeze immutability, the decision queue, the shell classifier (including command substitution, pipe destinations, and the documented false positives that must *not* block), gate coverage, abort handling, session guards, rewind invalidation, and drift detection.
 
 The suite catches dangling references, dependency cycles, and leaky contracts
 each producing `REJECT` and each blocking the advance to Phase 8.
@@ -160,7 +160,8 @@ The test runs against a temporary workspace and needs `@sinclair/typebox` and `@
 Worth stating plainly.
 
 - **The session guard can trap a user.** `session_before_switch` cancels when decisions are unresolved at Phase 8 or later. The only exit is `sessionGuards: false` below. Accepted as a rough edge, not solved.
-- **The shell classifier is not a POSIX parser.** It handles quoting, the common separators, and output redirection; it does not expand variables, here-docs, or process substitution. Parse uncertainty fails open — except pipe-to-shell, which fails closed.
+- **The shell classifier is not a POSIX parser.** It handles quoting, the common separators, output redirection, command substitution, and pipe destinations; it does not expand here-docs or process substitution. Parse uncertainty fails open — except pipe-to-shell, which fails closed.
+- **`bash script.sh` is not classified.** Only `bash -c '<command>'` and pipes into an interpreter count as remote execution.
 - **The write gate covers the tools declared in `.pi/fleet-gate.json`**, default `write`, `edit`, `multi_edit`, `patch`, `bash`, `shell`. `fleet_gate_coverage` (or `/fleet:gate`) reports that list alongside what the gate *cannot* reach: writes by MCP servers, writes by subprocesses spawned by other extensions, and in-process mutation via `pi.exec`.
 - **Verification reads the store**, so it validates what the `fleet_*` tools wrote. Hand-edited documents are not silently trusted — they surface as drift at `low` severity, which never contributes to `REJECT`.
 - **Gate composition with other extensions is unverified.** If `damage-control` also blocks a call, whether both reasons surface or one wins was not tested here.

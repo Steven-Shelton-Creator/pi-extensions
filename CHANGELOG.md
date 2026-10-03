@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **Branch:** `feat/gate-hardening` · **Parent:** `a10c5fb`
 **Spec:** SPEC.md (reviewed — see REVIEW.md) · **Changes:** CHANGES.md
-**Tests:** 163 assertions, 0 failures (up from 107)
+**Tests:** 181 assertions, 0 failures (up from 107)
 
 Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.
 
@@ -35,6 +35,18 @@ Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.
 - **Drift detection reported false positives** against `06_INTERFACE_REGISTRY.md`
   (a deliberately filtered rendering of the same registry) and against adapter
   blocks inside `07_DEPENDENCY_REGISTER.md`.
+- **The `piped` flag marked the pipe *source*, not the destination.** The field
+  is documented as "target of a pipe" and the code did the opposite, which made
+  the pipe-to-shell rule dead code — `cat s.sh | bash` was allowed. The
+  curl/wget rule only appeared to work because it inspected the source.
+- **Command substitution was not tokenized.** `SEPARATORS` contained no `$(`,
+  backtick or `)`, so `echo $(git commit -m x)` produced a single token `$(git`
+  and passed the gate. Six false negatives across `$( )`, backticks, nested
+  substitution, assignment-from-substitution, and `bash -c '<command>'`.
+- **`bash -c '<command>'` was not classified.** The quoted payload became
+  separate tokens and resolved to the interpreter's name, which matched nothing.
+- **Pipe-to-shell required `argv.length === 1`**, missing `cat s.sh | bash -s`
+  and `cat s.sh | sh -s -- --flag`.
 
 ### Added
 
@@ -64,6 +76,15 @@ Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.
   long-running, so this removes a correctness hazard (a turn aborted between
   computation and `saveState` could still persist) rather than making anything
   interruptible.
+- **Command substitution and pipe destinations are now classified.** `$( … )`
+  and backticks are recursively tokenized and their inner commands classified as
+  their own segments, because anything that mutates inside a substitution mutates
+  exactly as if it had been typed directly. `${…}` is variable expansion, not a
+  command. A pipe is remote execution when its *destination* is a shell
+  interpreter, regardless of source or of flags on the interpreter — so
+  `make | sh` and `cat s.sh | bash -s` block while `curl x | jq .` does not.
+  The curl/wget "piped onward" rule was removed: it inspected the wrong side of
+  the pipe and would have blocked ordinary pipelines once the flag was corrected.
 
 ### Known limitations
 
@@ -71,7 +92,12 @@ Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.
   mid-decision at Phase 8+. `sessionGuards: false` is the only exit.
   Accepted as a rough edge, documented rather than solved.
 - The shell tokenizer is not a full POSIX parser. It handles quoting, the common
-  separators, and redirection; it does not expand variables or here-docs.
+  separators, redirection, command substitution, and pipe destinations; it does
+  not expand here-docs or process substitution (`<(…)`, `>(…)`). Unbalanced
+  quoting fails open.
+- A shell interpreter invoked as `bash script.sh` is not classified — only
+  `bash -c '<command>'` and pipes into an interpreter are. Running an arbitrary
+  script is not treated as mutation.
 - Gate coverage of non-tool write paths (MCP, foreign subprocesses) remains
   out of reach from `tool_call`. C5 makes the gap visible instead of implicit.
 - Gate composition with other extensions that also return a `tool_call` verdict
@@ -79,12 +105,18 @@ Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.
 
 ### Tests
 
-`node test/smoke.mjs` — **163 assertions, 0 failures**, up from 107.
+`node test/smoke.mjs` — **181 assertions, 0 failures**, up from 107.
 
-New coverage: 25 tokenizer/classifier cases including the six documented false
-positives, 7 gate-coverage assertions, 3 abort assertions, 6 session-guard
-assertions, 8 rewind-invalidation assertions, 7 drift assertions. All 107
-0.2.0 assertions remain green, including every REJECT path.
+New coverage: 40 tokenizer/classifier cases including the documented false
+positives that must *not* block, plus command substitution and pipe-destination
+forms; 7 gate-coverage, 3 abort, 6 session-guard, 8 rewind-invalidation, and
+7 drift assertions. All 107 0.2.0 assertions remain green, including every
+REJECT path.
+
+Eight defects in this release's own code were found by the suite or by
+pre-merge probing — three in C1 (empty argv vectors, unskipped interleaved
+wrappers, missed git value-taking flags) and two more from the reviewer's
+probes (mis-flagged pipe destination, unhandled command substitution).
 
 ---
 

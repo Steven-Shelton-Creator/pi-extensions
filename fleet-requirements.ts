@@ -12,7 +12,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import {
   PHASES, REQ_FILE, RISK_FILE,
   archPath, ensureArchDir, loadState, saveState, audit,

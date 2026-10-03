@@ -21,7 +21,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import {
   PHASES, MAX_PHASE, FREEZE_PHASE,
   JOB_FILE, DECISION_FILE, AUDIT_FILE, OVERRIDE_FILE,

@@ -1,23 +1,27 @@
 /**
- * fleet-module :: [MACRO] Phase 4 — Module Boundary Decomposition
+ * fleet-module :: Phase 4 — Module Boundaries
  *
- * Splits the system into small independently implementable black-box modules.
- * Each module has one responsibility, documented inputs/outputs, bounded state,
- * and a replacement strategy.
+ * Each module declares one responsibility, the state it owns, the interfaces it
+ * consumes and exposes, and the modules it depends on. The dependency graph is
+ * verified acyclic in Phase 7, so every reference recorded here is load-bearing.
  *
- * Gate: Phase 3 (FORMATS + CONTRACTS) must be complete.
+ * Commands: /fleet:modules /fleet:mod-edit
+ * Tools:    fleet_define_module, fleet_edit_module, fleet_list_modules
  *
- * /fleet:modules   — define module boundaries
- * /fleet:mod-edit  — update an existing module
+ * Usage: pi -e extensions/fleet-module.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  MOD_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface ModuleDef {
+export interface ModuleDef {
   id: string;
   name: string;
   responsibility: string;
@@ -25,7 +29,7 @@ interface ModuleDef {
   doesNotOwn: string[];
   consumesInterfaces: string[];
   exposesInterfaces: string[];
-  dependencies: string[];        // other MOD-IDs this module depends on
+  dependencies: string[];
   invariants: string[];
   replaceable: boolean;
   implementationOwner: string | null;
@@ -33,45 +37,91 @@ interface ModuleDef {
   status: "draft" | "review" | "approved";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Operations ──────────────────────────────────────────────────────────────
 
-const ARCH_DIR = "architecture";
-const MOD_FILE = "05_MODULE_REGISTRY.md";
-
-function cwd(): string {
-  return process.cwd();
+function modules(state: FleetState): ModuleDef[] {
+  if (!state.modules) state.modules = [];
+  return state.modules as ModuleDef[];
 }
 
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
-}
+const FIELDS: Record<string, keyof ModuleDef> = {
+  responsibility: "responsibility",
+  owns: "owns",
+  doesnotown: "doesNotOwn",
+  consumes: "consumesInterfaces",
+  exposes: "exposesInterfaces",
+  dependencies: "dependencies",
+  invariants: "invariants",
+  replaceable: "replaceable",
+  owner: "implementationOwner",
+  teststrategy: "testStrategy",
+  status: "status",
+};
 
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
-}
-
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try {
-      return JSON.parse(readFileSync(jsonPath, "utf8"));
-    } catch {
-      return null;
-    }
+export function defineModule(state: FleetState, input: Partial<ModuleDef>) {
+  const list = modules(state);
+  if (!input.name?.trim()) return { ok: false, message: "name is required" };
+  if (!input.responsibility?.trim()) {
+    return { ok: false, message: "responsibility is required — a module without one has no boundary" };
   }
-  return null;
+
+  const id = input.id?.trim() || `MOD-${String(list.length + 1).padStart(3, "0")}`;
+  if (list.some((m) => m.id === id)) return { ok: false, message: `${id} already exists` };
+
+  const mod: ModuleDef = {
+    id,
+    name: input.name.trim(),
+    responsibility: input.responsibility.trim(),
+    owns: input.owns || [],
+    doesNotOwn: input.doesNotOwn || [],
+    consumesInterfaces: input.consumesInterfaces || [],
+    exposesInterfaces: input.exposesInterfaces || [],
+    dependencies: (input.dependencies || []).filter((d) => d !== id),
+    invariants: input.invariants || [],
+    replaceable: input.replaceable !== false,
+    implementationOwner: input.implementationOwner || null,
+    testStrategy: input.testStrategy?.trim() || "",
+    status: "draft",
+  };
+
+  list.push(mod);
+  saveState(state);
+  writeModuleFile(state);
+  audit(`module defined ${id}`, state);
+  return { ok: true, message: `${id} defined (${list.length} total)` };
+}
+
+export function editModule(state: FleetState, id: string, field: string, value: string) {
+  const mod = modules(state).find((m) => m.id === id);
+  if (!mod) return { ok: false, message: `Module ${id} not found` };
+
+  const key = FIELDS[field.toLowerCase().replace(/[\s-]/g, "")];
+  if (!key) return { ok: false, message: `Unknown field "${field}". Known: ${Object.keys(FIELDS).join(", ")}` };
+
+  const listFields = ["owns", "doesNotOwn", "consumesInterfaces", "exposesInterfaces", "dependencies", "invariants"];
+  if (listFields.includes(key as string)) {
+    (mod as any)[key] = value.split(",").map((s) => s.trim()).filter(Boolean);
+  } else if (key === "replaceable") {
+    mod.replaceable = /^(true|yes|y|true)$/i.test(value);
+  } else {
+    (mod as any)[key] = value;
+  }
+
+  saveState(state);
+  writeModuleFile(state);
+  audit(`module edited ${id}.${field}`, state);
+  return { ok: true, message: `${id}.${key} updated` };
 }
 
 // ─── Writer ──────────────────────────────────────────────────────────────────
 
-function writeModuleFile(modules: ModuleDef[]) {
+function writeModuleFile(state: FleetState) {
   ensureArchDir();
-  if (modules.length === 0) {
+  const list = modules(state);
+  if (list.length === 0) {
     writeFileSync(archPath(MOD_FILE), "# Module Registry\n\n*No modules defined yet.*\n", "utf8");
     return;
   }
-
   const lines = [
     "# Module Registry",
     "",
@@ -80,262 +130,145 @@ function writeModuleFile(modules: ModuleDef[]) {
     "| ID | Name | Responsibility | Status | Owner | Replaceable |",
     "|---|---|---|---|---|---|",
   ];
-
-  for (const m of modules) {
-    lines.push(
-      `| ${m.id} | ${m.name} | ${m.responsibility.slice(0, 60)}${m.responsibility.length > 60 ? "..." : ""} | ${m.status} | ${m.implementationOwner || "—"} | ${m.replaceable ? "✅" : "❌"} |`
-    );
+  for (const m of list) {
+    const r = m.responsibility.slice(0, 60);
+    lines.push(`| ${m.id} | ${m.name} | ${r}${m.responsibility.length > 60 ? "..." : ""} | ${m.status} | ${m.implementationOwner || "—"} | ${m.replaceable ? "✅" : "❌"} |`);
   }
-
-  lines.push("");
-  lines.push("---");
-  lines.push("");
-
-  for (const m of modules) {
+  lines.push("", "---", "");
+  for (const m of list) {
     lines.push(`## ${m.id} — ${m.name}`);
     lines.push("");
     lines.push(`**Responsibility:** ${m.responsibility}`);
     lines.push(`**Status:** ${m.status}  **Owner:** ${m.implementationOwner || "_unassigned_"}  **Replaceable:** ${m.replaceable ? "✅" : "❌"}`);
     lines.push("");
-    lines.push("### Owns");
-    for (const o of m.owns) lines.push(`- ${o}`);
-    if (m.owns.length === 0) lines.push("_none explicitly_");
-    lines.push("");
-    lines.push("### Does Not Own");
-    for (const o of m.doesNotOwn) lines.push(`- ${o}`);
-    if (m.doesNotOwn.length === 0) lines.push("_none explicitly_");
-    lines.push("");
-    lines.push("### Consumes Interfaces");
-    for (const i of m.consumesInterfaces) lines.push(`- ${i}`);
-    if (m.consumesInterfaces.length === 0) lines.push("_none_");
-    lines.push("");
-    lines.push("### Exposes Interfaces");
-    for (const i of m.exposesInterfaces) lines.push(`- ${i}`);
-    if (m.exposesInterfaces.length === 0) lines.push("_none_");
-    lines.push("");
-    lines.push("### Module Dependencies");
-    for (const d of m.dependencies) lines.push(`- ${d}`);
-    if (m.dependencies.length === 0) lines.push("_none_");
-    lines.push("");
-    lines.push("### Invariants");
-    for (const inv of m.invariants) lines.push(`- ${inv}`);
-    if (m.invariants.length === 0) lines.push("_none_");
-    lines.push("");
+    for (const [heading, values] of [
+      ["Owns", m.owns],
+      ["Does Not Own", m.doesNotOwn],
+      ["Consumes Interfaces", m.consumesInterfaces],
+      ["Exposes Interfaces", m.exposesInterfaces],
+      ["Module Dependencies", m.dependencies],
+      ["Invariants", m.invariants],
+    ] as const) {
+      lines.push(`### ${heading}`);
+      if (values.length) for (const v of values) lines.push(`- ${v}`);
+      else lines.push("_none_");
+      lines.push("");
+    }
     lines.push("### Test Strategy");
     lines.push(m.testStrategy || "_not specified_");
     lines.push("");
     lines.push("---");
     lines.push("");
   }
-
   writeFileSync(archPath(MOD_FILE), lines.join("\n"), "utf8");
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let modules: ModuleDef[] = [];
-
-  pi.on("session_start", async () => {
-    const statePath = archPath("mod-state.json");
-    if (existsSync(statePath)) {
-      try {
-        const saved = JSON.parse(readFileSync(statePath, "utf8"));
-        modules = saved.modules || [];
-      } catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state?.job?.objective) {
-      ctx.ui.notify("No job initialized. Run /fleet:new-job first.", "warning");
-      return false;
-    }
-    if (!fleet.state.phaseGates?.[3]) {
-      ctx.ui.notify("Phase 3 (FORMATS + CONTRACTS) not complete. Run /fleet:format and advance with /fleet:phase 4.", "warning");
-      return false;
-    }
-    return true;
-  }
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(archPath("mod-state.json"), JSON.stringify({ modules }, null, 2), "utf8");
-    writeModuleFile(modules);
-  }
-
-  // ─── Command: fleet:modules ────────────────────────────────────────────
 
   pi.registerCommand("fleet:modules", {
     description: "Define module boundaries (Phase 4)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify(
-        "Module decomposition. Each module is a black box with one responsibility, documented interfaces, and bounded state.",
-        "info"
-      );
-
-      // Show existing contracts for reference
-      const fmtPath = archPath("04_FORMAT_REGISTRY.md");
-      if (existsSync(fmtPath)) {
-        const fmtContent = readFileSync(fmtPath, "utf8");
-        const contractLines = fmtContent.split("\n").filter((l) => l.startsWith("| `FMT-"));
-        if (contractLines.length > 0) {
-          ctx.ui.notify(`Existing contracts:\n${contractLines.join("\n")}`, "info");
-        }
-      }
-
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input(
-          `Module #${modules.length + 1} name (e.g., 'Document Store', 'Search Engine') — or blank to stop`,
-          ""
-        );
-        if (!name) { addMore = false; break; }
-
-        const responsibility = await ctx.ui.input("Single responsibility (one clear sentence)", "");
-        const ownsRaw = await ctx.ui.input("Owns (comma-separated, what data/code belongs here)", "");
-        const owns = ownsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const dnoRaw = await ctx.ui.input("Explicitly does NOT own (comma-separated)", "");
-        const doesNotOwn = dnoRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const consRaw = await ctx.ui.input("Consumes interfaces (FMT-xxx IDs, comma-separated)", "");
-        const consumesInterfaces = consRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-        const expRaw = await ctx.ui.input("Exposes interfaces (FMT-xxx IDs, comma-separated)", "");
-        const exposesInterfaces = expRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const depsRaw = await ctx.ui.input("Module dependencies (MOD-xxx IDs, comma-separated)", "");
-        const dependencies = depsRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const invRaw = await ctx.ui.input("Invariants (comma-separated)", "");
-        const invariants = invRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const testStrategy = await ctx.ui.input("Test strategy", "unit tests + integration via shared contracts");
-
-        const id = `MOD-${String(modules.length + 1).padStart(3, "0")}`;
-
-        const mod: ModuleDef = {
-          id,
-          name,
-          responsibility: responsibility || name,
-          owns,
-          doesNotOwn,
-          consumesInterfaces,
-          exposesInterfaces,
-          dependencies,
-          invariants,
-          replaceable: true,
-          implementationOwner: null,
-          testStrategy: testStrategy || "unit tests",
-          status: "draft",
-        };
-
-        modules.push(mod);
-
-        // Assign owner
-        const assignOwner = await ctx.ui.confirm(
-          "Assign implementation owner?",
-          "This will be the primary agent responsible"
-        );
-        if (assignOwner) {
-          const owner = await ctx.ui.input("Owner station/agent name (e.g., 'forgecrafter', 'nova')", "");
-          if (owner) mod.implementationOwner = owner;
-        }
-
-        saveState();
-        ctx.ui.notify(`🧩 Module ${id} — "${name}" defined`, "info");
-
-        const more = await ctx.ui.confirm("Add another module?", "");
-        if (!more) addMore = false;
-      }
-
-      saveState();
-      ctx.ui.notify(`✅ ${modules.length} modules defined in ${MOD_FILE}`, "info");
-
-      // Check for dependency cycle warning
-      if (modules.length > 1) {
-        ctx.ui.notify(
-          "⚠️  Review the module graph for dependency cycles before advancing to Phase 5.",
-          "info"
-        );
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Module name (blank to finish)", "");
+        if (!name) break;
+        const responsibility = await ctx.ui.input("Single responsibility", "");
+        const owns = await ctx.ui.input("Owns (comma-separated)", "");
+        const consumes = await ctx.ui.input("Consumes interfaces (FMT ids)", "");
+        const exposes = await ctx.ui.input("Exposes interfaces (FMT ids)", "");
+        const deps = await ctx.ui.input("Module dependencies (MOD ids)", "");
+        const strategy = await ctx.ui.input("Test strategy", "");
+        const split = (s: string) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean) : []);
+        const res = defineModule(state, {
+          name, responsibility, owns: split(owns),
+          consumesInterfaces: split(consumes), exposesInterfaces: split(exposes),
+          dependencies: split(deps), testStrategy: strategy,
+        });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
     },
   });
 
-  // ─── Command: fleet:mod-edit ───────────────────────────────────────────
-
   pi.registerCommand("fleet:mod-edit", {
-    description: "Edit an existing module (usage: /fleet:mod-edit <MOD-xxx> <field> <value>)",
+    description: "Edit a module (/fleet:mod-edit <MOD-xxx> <field> <value>)",
     handler: async (args, ctx) => {
-      if (!checkGate(ctx)) return;
-
       const parts = (args || "").trim().split(/\s+/);
       if (parts.length < 3) {
-        ctx.ui.notify(
-          "Usage: /fleet:mod-edit <MOD-id> <field> <value> | /fleet:mod-edit <MOD-id> (interactive)",
-          "warning"
-        );
+        ctx.ui.notify("Usage: /fleet:mod-edit <MOD-xxx> <field> <value>", "warning");
         return;
       }
+      const res = editModule(loadState(), parts[0], parts[1], parts.slice(2).join(" "));
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+    },
+  });
 
-      const modId = parts[0].toUpperCase();
-      const mod = modules.find((m) => m.id === modId);
-      if (!mod) {
-        ctx.ui.notify(`Module ${modId} not found. Available: ${modules.map((m) => m.id).join(", ")}`, "error");
-        return;
-      }
+  pi.registerTool({
+    name: "fleet_define_module",
+    label: "Define Module",
+    description:
+      "Define a module with one responsibility and bounded state. 'owns' must be non-empty and every consumes/exposes/dependencies entry must be an id that already exists — Phase 7 treats dangling references and dependency cycles as REJECT.",
+    parameters: Type.Object({
+      name: Type.String(),
+      responsibility: Type.String({ description: "The single thing this module is responsible for" }),
+      owns: Type.Array(Type.String(), { description: "State/concerns this module owns. Must be non-empty." }),
+      doesNotOwn: Type.Optional(Type.Array(Type.String())),
+      consumesInterfaces: Type.Optional(Type.Array(Type.String(), { description: "FMT- ids" })),
+      exposesInterfaces: Type.Optional(Type.Array(Type.String(), { description: "FMT- ids" })),
+      dependencies: Type.Optional(Type.Array(Type.String(), { description: "MOD- ids. Keep this acyclic." })),
+      invariants: Type.Optional(Type.Array(Type.String())),
+      replaceable: Type.Optional(Type.Boolean({ description: "Default true" })),
+      implementationOwner: Type.Optional(Type.String()),
+      testStrategy: Type.Optional(Type.String({ description: "How this module is tested" })),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = defineModule(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
 
-      // If user provides field + value inline
-      if (parts.length >= 3 && parts[1] !== "interactive") {
-        const field = parts[1].toLowerCase();
-        const value = parts.slice(2).join(" ");
-        switch (field) {
-          case "owner":
-            mod.implementationOwner = value;
-            break;
-          case "responsibility":
-            mod.responsibility = value;
-            break;
-          case "status":
-            if (["draft", "review", "approved"].includes(value)) {
-              mod.status = value as any;
-            } else {
-              ctx.ui.notify("Status must be: draft, review, or approved", "warning");
-              return;
-            }
-            break;
-          case "replaceable":
-            mod.replaceable = value === "true" || value === "yes";
-            break;
-          default:
-            ctx.ui.notify(`Unknown field: ${field}. Fields: owner, responsibility, status, replaceable`, "warning");
-            return;
-        }
-        saveState();
-        ctx.ui.notify(`✅ ${modId}: ${field} updated`, "info");
-        return;
-      }
+  pi.registerTool({
+    name: "fleet_edit_module",
+    label: "Edit Module",
+    description:
+      "Amend an existing module. List-valued fields accept comma-separated values. Edits to frozen artifacts are refused by the write gate once contracts are frozen.",
+    parameters: Type.Object({
+      id: Type.String({ description: "MOD- id" }),
+      field: Type.String({
+        description:
+          "One of: responsibility, owns, doesNotOwn, consumes, exposes, dependencies, invariants, replaceable, owner, testStrategy, status",
+      }),
+      value: Type.String(),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const p = params as any;
+      const res = editModule(loadState(), p.id, p.field, p.value);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
 
-      // Interactive edit
-      ctx.ui.notify(`Editing ${modId} — "${mod.name}"`, "info");
-
-      const resp = await ctx.ui.input("Responsibility", mod.responsibility);
-      if (resp) mod.responsibility = resp;
-
-      const owner = await ctx.ui.input("Implementation owner", mod.implementationOwner || "");
-      mod.implementationOwner = owner || null;
-
-      const statusRaw = await ctx.ui.select("Status", [
-        { label: "Draft", value: "draft" },
-        { label: "Review", value: "review" },
-        { label: "Approved", value: "approved" },
-      ]);
-      if (statusRaw) mod.status = statusRaw as any;
-
-      saveState();
-      ctx.ui.notify(`✅ ${modId} updated`, "info");
+  pi.registerTool({
+    name: "fleet_list_modules",
+    label: "List Modules",
+    description: "List every defined module with its responsibility, owner, and dependencies.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      const list = modules(loadState());
+      const text = list.length === 0
+        ? "No modules defined."
+        : list
+            .map((m) => `${m.id} — ${m.name}: ${m.responsibility} [deps: ${m.dependencies.join(", ") || "none"}]`)
+            .join("\n");
+      return { content: [{ type: "text", text }], details: { count: list.length } };
     },
   });
 }

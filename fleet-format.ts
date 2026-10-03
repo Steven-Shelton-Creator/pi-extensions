@@ -1,23 +1,32 @@
 /**
- * fleet-format :: [MACRO] Phase 3 — Format & Contract Design
+ * fleet-format :: Phase 3 — Format + Interface Contracts
  *
- * Designs the semantic formats through which modules communicate.
- * Treats API, file format, network protocol, event schema, plugin contract,
- * and serialization as related forms of format design.
+ * Defines the contracts that shield the rest of the system from
+ * implementation detail. Two documents are rendered from one registry:
+ * 04_FORMAT_REGISTRY.md (all contracts) and 06_INTERFACE_REGISTRY.md
+ * (interface/plugin contracts only).
  *
- * Gate: Phase 2 (PRIMITIVE) must be complete.
+ * The two renderings deliberately use different wording for the same
+ * implementation-freedom flags — "Storage hidden: ✅" versus
+ * "Storage technology exposed? ✅ No". fleet-verify normalizes both forms.
  *
- * /fleet:format     — define a semantic format or interface contract
- * /fleet:contracts  — list all registered contracts
+ * Commands: /fleet:format /fleet:contracts
+ * Tools:    fleet_define_contract
+ *
+ * Usage: pi -e extensions/fleet-format.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  FMT_FILE, INT_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface FormatContract {
+export interface FormatContract {
   id: string;
   name: string;
   type: "interface" | "event" | "file-format" | "protocol" | "serialization" | "plugin";
@@ -25,59 +34,85 @@ interface FormatContract {
   structure: string;
   invariants: string;
   version: string;
-
-  // Implementation freedom check
   hidesStorage: boolean;
   hidesVendor: boolean;
   hidesPlatform: boolean;
   hidesAlgorithm: boolean;
   alternativeImplementable: boolean;
-
   consumers: string[];
   producers: string[];
   status: "draft" | "review" | "frozen";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Operations ──────────────────────────────────────────────────────────────
 
-const ARCH_DIR = "architecture";
-const FMT_FILE = "04_FORMAT_REGISTRY.md";
-const INT_FILE = "06_INTERFACE_REGISTRY.md";
-
-function cwd(): string {
-  return process.cwd();
+function contracts(state: FleetState): FormatContract[] {
+  if (!state.contracts) state.contracts = [];
+  return state.contracts as FormatContract[];
 }
 
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
+function nextId(list: FormatContract[]): string {
+  return `FMT-${String(list.length + 1).padStart(3, "0")}`;
 }
 
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
-}
-
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try {
-      return JSON.parse(readFileSync(jsonPath, "utf8"));
-    } catch {
-      return null;
-    }
+export function defineContract(state: FleetState, input: Partial<FormatContract>) {
+  const list = contracts(state);
+  if (!input.name?.trim()) return { ok: false, message: "name is required" };
+  if (!input.semantics?.trim()) {
+    return { ok: false, message: "semantics is required — a contract without meaning cannot be verified" };
   }
-  return null;
+
+  const id = input.id?.trim() || nextId(list);
+  const existing = list.find((c) => c.id === id);
+  if (existing) {
+    if (!input.confirmReplace) {
+      return { ok: false, message: `${id} already exists — pass confirmReplace to revise it` };
+    }
+    Object.assign(existing, buildContract(input, id));
+    saveState(state);
+    writeFormatFile(state);
+    writeInterfaceFile(state);
+    audit(`contract revised ${id}`, state);
+    return { ok: true, message: `${id} revised` };
+  }
+
+  list.push(buildContract(input, id));
+  saveState(state);
+  writeFormatFile(state);
+  writeInterfaceFile(state);
+  audit(`contract defined ${id}`, state);
+  return { ok: true, message: `${id} defined (${input.type || "interface"})` };
+}
+
+function buildContract(input: Partial<FormatContract>, id: string): FormatContract {
+  return {
+    id,
+    name: input.name!.trim(),
+    type: (input.type || "interface") as FormatContract["type"],
+    semantics: input.semantics!.trim(),
+    structure: input.structure?.trim() || "",
+    invariants: input.invariants?.trim() || "",
+    version: input.version?.trim() || "1",
+    hidesStorage: input.hidesStorage !== false,
+    hidesVendor: input.hidesVendor !== false,
+    hidesPlatform: input.hidesPlatform !== false,
+    hidesAlgorithm: input.hidesAlgorithm !== false,
+    alternativeImplementable: input.alternativeImplementable !== false,
+    consumers: input.consumers || [],
+    producers: input.producers || [],
+    status: "draft",
+  };
 }
 
 // ─── Writers ─────────────────────────────────────────────────────────────────
 
-function writeFormatFile(contracts: FormatContract[]) {
+function writeFormatFile(state: FleetState) {
   ensureArchDir();
-  if (contracts.length === 0) {
+  const list = contracts(state);
+  if (list.length === 0) {
     writeFileSync(archPath(FMT_FILE), "# Format Registry\n\n*No formats registered yet.*\n", "utf8");
     return;
   }
-
   const lines = [
     "# Format Registry",
     "",
@@ -86,25 +121,20 @@ function writeFormatFile(contracts: FormatContract[]) {
     "| ID | Name | Type | Version | Status | Consumers | Producers |",
     "|---|---|---|---|---|---|---|",
   ];
-
-  for (const c of contracts) {
+  for (const c of list) {
     lines.push(
       `| ${c.id} | ${c.name} | ${c.type} | ${c.version} | ${c.status} | ${c.consumers.join(", ") || "—"} | ${c.producers.join(", ") || "—"} |`
     );
   }
-
-  lines.push("");
-  lines.push("---");
-  lines.push("");
-
-  for (const c of contracts) {
+  lines.push("", "---", "");
+  for (const c of list) {
     lines.push(`## ${c.id} — ${c.name}`);
     lines.push("");
     lines.push("### Semantics");
     lines.push(c.semantics);
     lines.push("");
     lines.push("### Structure");
-    lines.push(c.structure);
+    lines.push(c.structure || "_unspecified_");
     lines.push("");
     lines.push("### Invariants");
     lines.push(c.invariants || "_none_");
@@ -124,26 +154,17 @@ function writeFormatFile(contracts: FormatContract[]) {
     lines.push("---");
     lines.push("");
   }
-
   writeFileSync(archPath(FMT_FILE), lines.join("\n"), "utf8");
 }
 
-function writeInterfaceFile(contracts: FormatContract[]) {
+function writeInterfaceFile(state: FleetState) {
   ensureArchDir();
-  const interfaces = contracts.filter((c) => c.type === "interface" || c.type === "plugin");
-
+  const interfaces = contracts(state).filter((c) => c.type === "interface" || c.type === "plugin");
   if (interfaces.length === 0) {
     writeFileSync(archPath(INT_FILE), "# Interface Registry\n\n*No interfaces registered yet.*\n", "utf8");
     return;
   }
-
-  const lines = [
-    "# Interface Registry",
-    "",
-    `*Generated by fleet-format · ${new Date().toISOString()}*`,
-    "",
-  ];
-
+  const lines = ["# Interface Registry", "", `*Generated by fleet-format · ${new Date().toISOString()}*`, ""];
   for (const c of interfaces) {
     lines.push(`## ${c.id} — ${c.name}`);
     lines.push(`**Type:** ${c.type}`);
@@ -153,7 +174,7 @@ function writeInterfaceFile(contracts: FormatContract[]) {
     lines.push(c.semantics);
     lines.push("");
     lines.push("### Structure");
-    lines.push(c.structure);
+    lines.push(c.structure || "_unspecified_");
     lines.push("");
     lines.push("### Invariants");
     lines.push(c.invariants || "_none_");
@@ -164,154 +185,114 @@ function writeInterfaceFile(contracts: FormatContract[]) {
     lines.push(`- Vendor concepts exposed? ${c.hidesVendor ? "✅ No" : "❌ Yes"}`);
     lines.push(`- Platform concepts exposed? ${c.hidesPlatform ? "✅ No" : "❌ Yes"}`);
     lines.push("");
+    lines.push(`**Consumers:** ${c.consumers.join(", ") || "—"}`);
+    lines.push(`**Producers:** ${c.producers.join(", ") || "—"}`);
+    lines.push("");
     lines.push("---");
     lines.push("");
   }
-
   writeFileSync(archPath(INT_FILE), lines.join("\n"), "utf8");
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let contracts: FormatContract[] = [];
-
-  pi.on("session_start", async () => {
-    const statePath = archPath("fmt-state.json");
-    if (existsSync(statePath)) {
-      try {
-        const saved = JSON.parse(readFileSync(statePath, "utf8"));
-        contracts = saved.contracts || [];
-      } catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state?.job?.objective) {
-      ctx.ui.notify("No job initialized. Run /fleet:new-job first.", "warning");
-      return false;
-    }
-    if (!fleet.state.phaseGates?.[2]) {
-      ctx.ui.notify("Phase 2 (PRIMITIVE) not complete. Run /fleet:primitive and advance with /fleet:phase 3.", "warning");
-      return false;
-    }
-    return true;
-  }
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(archPath("fmt-state.json"), JSON.stringify({ contracts }, null, 2), "utf8");
-    writeFormatFile(contracts);
-    writeInterfaceFile(contracts);
-  }
-
-  // ─── Command: fleet:format ─────────────────────────────────────────────
 
   pi.registerCommand("fleet:format", {
     description: "Define a format or interface contract (Phase 3)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify(
-        "Define a semantic format. This could be an API interface, file format, event schema, protocol, or serialization.",
-        "info"
-      );
-
-      const name = await ctx.ui.input("Contract name (e.g., 'Document API', 'Event Bus Protocol')", "");
-      if (!name) { ctx.ui.notify("Cancelled.", "info"); return; }
-
-      const typeRaw = await ctx.ui.select("Type", [
-        { label: "Interface (API)", value: "interface" },
-        { label: "Event Schema", value: "event" },
-        { label: "File Format", value: "file-format" },
-        { label: "Protocol", value: "protocol" },
-        { label: "Serialization", value: "serialization" },
-        { label: "Plugin Contract", value: "plugin" },
-      ]);
-      const type = typeRaw || "interface";
-
-      const semantics = await ctx.ui.input(
-        "Semantics — what does this information mean? What guarantees exist?",
-        ""
-      );
-      const structure = await ctx.ui.input(
-        "Structure — how is it represented, transferred, parsed?",
-        ""
-      );
-      const invariants = await ctx.ui.input(
-        "Invariants — what must always hold true?",
-        ""
-      );
-
-      // Implementation freedom checks
-      ctx.ui.notify("Now checking implementation freedom for this contract.", "info");
-      const hideStorage = await ctx.ui.confirm("Storage technology hidden?", "Does the contract expose DB/file specifics?");
-      const hideVendor = await ctx.ui.confirm("Vendor concepts hidden?", "Does it mention AWS, Google, etc.?");
-      const hidePlatform = await ctx.ui.confirm("Platform concepts hidden?", "Does it require specific OS/hardware?");
-      const hideAlgorithm = await ctx.ui.confirm("Internal algorithms hidden?", "Does it expose how things are computed internally?");
-      const alternativeImpl = await ctx.ui.confirm("Alternative implementable?", "Could a completely different implementation satisfy this contract?");
-
-      const consumersRaw = await ctx.ui.input("Consumers (comma-separated module names)", "");
-      const producersRaw = await ctx.ui.input("Producers (comma-separated module names)", "");
-      const consumers = consumersRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-      const producers = producersRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-      const id = `FMT-${String(contracts.length + 1).padStart(3, "0")}`;
-
-      const contract: FormatContract = {
-        id,
-        name,
-        type: type as any,
-        semantics: semantics || "_to be defined_",
-        structure: structure || "_to be defined_",
-        invariants: invariants || "_none_",
-        version: "0.1",
-        hidesStorage: hideStorage,
-        hidesVendor: hideVendor,
-        hidesPlatform: hidePlatform,
-        hidesAlgorithm: hideAlgorithm,
-        alternativeImplementable: alternativeImpl,
-        consumers,
-        producers,
-        status: "draft",
-      };
-
-      contracts.push(contract);
-      saveState();
-      ctx.ui.notify(`📐 Contract ${id} — "${name}" registered (draft)`, "info");
-
-      // Ask to freeze
-      const freeze = await ctx.ui.confirm("Freeze this contract?", "Frozen contracts are stable for implementation");
-      if (freeze) {
-        contract.status = "frozen";
-        contract.version = "1.0";
-        saveState();
-
-        // Also register in orchestrator state
-        const fleet = loadFleetState();
-        if (fleet?.state && !fleet.state.frozenContracts.includes(id)) {
-          fleet.state.frozenContracts.push(id);
-          writeFileSync(archPath("fleet-state.json"), JSON.stringify(fleet, null, 2), "utf8");
-        }
-        ctx.ui.notify(`❄️ Contract ${id} frozen at v1.0`, "info");
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Contract name (blank to finish)", "");
+        if (!name) break;
+        const type = await ctx.ui.input("Type (interface/event/file-format/protocol/serialization/plugin)", "interface");
+        const semantics = await ctx.ui.input("Semantics (what it means)", "");
+        const structure = await ctx.ui.input("Structure", "");
+        const invariants = await ctx.ui.input("Invariants", "");
+        const consumers = await ctx.ui.input("Consumers (MOD ids, comma-separated)", "");
+        const producers = await ctx.ui.input("Producers (MOD ids, comma-separated)", "");
+        const split = (s: string) => (s ? s.split(",").map((x) => x.trim()).filter(Boolean) : []);
+        const res = defineContract(state, {
+          name, type: type as any, semantics, structure, invariants,
+          consumers: split(consumers), producers: split(producers),
+        });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
     },
   });
 
-  // ─── Command: fleet:contracts ──────────────────────────────────────────
-
   pi.registerCommand("fleet:contracts", {
     description: "List all registered contracts and their status",
     handler: async (_args, ctx) => {
-      if (contracts.length === 0) {
-        ctx.ui.notify("No contracts registered. Use /fleet:format to add one.", "info");
+      const state = loadState();
+      const list = contracts(state);
+      if (list.length === 0) {
+        ctx.ui.notify("No contracts registered.", "info");
         return;
       }
-      const lines = contracts.map(
-        (c) => `${c.id}: ${c.name} [${c.type}] v${c.version} — ${c.status}`
+      ctx.ui.notify(
+        list
+          .map((c) => `${c.id} — ${c.name} [${c.type}] ${c.status} v${c.version}`)
+          .join("\n"),
+        "info"
       );
-      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_define_contract",
+    label: "Define Contract",
+    description:
+      "Define a contract that shields the system from implementation detail. Contracts must state semantics, and must hide at least two of storage/vendor/platform or Phase 7 verification will REJECT them. Reference only MOD- ids that exist — dangling references are also a REJECT.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Contract name" }),
+      semantics: Type.String({ description: "What the contract means — required, and not a placeholder" }),
+      type: Type.Optional(
+        Type.Union([
+          Type.Literal("interface"), Type.Literal("event"), Type.Literal("file-format"),
+          Type.Literal("protocol"), Type.Literal("serialization"), Type.Literal("plugin"),
+        ])
+      ),
+      structure: Type.Optional(Type.String({ description: "Shape or schema of the contract" })),
+      invariants: Type.Optional(Type.String({ description: "What must always hold" })),
+      version: Type.Optional(Type.String()),
+      hidesStorage: Type.Optional(Type.Boolean({ description: "Default true" })),
+      hidesVendor: Type.Optional(Type.Boolean({ description: "Default true" })),
+      hidesPlatform: Type.Optional(Type.Boolean({ description: "Default true" })),
+      hidesAlgorithm: Type.Optional(Type.Boolean({ description: "Default true" })),
+      alternativeImplementable: Type.Optional(
+        Type.Boolean({ description: "Default true. False means only one implementation can satisfy it." })
+      ),
+      consumers: Type.Optional(Type.Array(Type.String(), { description: "MOD- ids" })),
+      producers: Type.Optional(Type.Array(Type.String(), { description: "MOD- ids" })),
+      id: Type.Optional(Type.String({ description: "Defaults to the next FMT-nnn" })),
+      confirmReplace: Type.Optional(
+        Type.Boolean({ description: "Set true to revise an existing contract id" })
+      ),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = defineContract(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_list_contracts",
+    label: "List Contracts",
+    description: "List every registered contract with its type, status, and version.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      const list = contracts(loadState());
+      const text = list.length === 0
+        ? "No contracts registered."
+        : list.map((c) => `${c.id} — ${c.name} [${c.type}] ${c.status} v${c.version}`).join("\n");
+      return { content: [{ type: "text", text }], details: { count: list.length } };
     },
   });
 }

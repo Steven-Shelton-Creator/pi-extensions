@@ -1,25 +1,29 @@
 /**
- * fleet-requirements :: [MACRO] Phase 1 — Requirements & Risk Extraction
+ * fleet-requirements :: Phase 1 — Requirements + Risk Register
  *
- * Reads source material and job definition, then guides the user to extract
- * functional requirements, non-functional requirements, and risks.
- * Writes architecture/01_REQUIREMENTS.md and architecture/02_RISK_REGISTER.md.
+ * Records functional and non-functional requirements and the risk register.
+ * State lives in the canonical fleet store (fleet-core), so it survives session
+ * restarts and compaction alongside every other phase.
  *
- * Gate: Phase 0 (JOB DEFINITION) must be complete.
+ * Commands: /fleet:requirements /fleet:risks /fleet:add-req /fleet:add-risk
+ * Tools:    fleet_add_requirement, fleet_add_risk, fleet_status_requirements
  *
- * /fleet:requirements — extract functional + non-functional requirements
- * /fleet:risks       — build the risk register
- * /fleet:add-req     — manually add a requirement
- * /fleet:add-risk    — manually add a risk
+ * Usage: pi -e extensions/fleet-requirements.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  PHASES, REQ_FILE, RISK_FILE,
+  archPath, ensureArchDir, loadState, saveState, audit,
+  gateForPhase, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface Requirement {
+export interface Requirement {
   id: string;
   type: "functional" | "non-functional";
   category: string;
@@ -29,7 +33,7 @@ interface Requirement {
   status: "proposed" | "approved" | "rejected";
 }
 
-interface Risk {
+export interface Risk {
   id: string;
   title: string;
   description: string;
@@ -39,98 +43,114 @@ interface Risk {
   status: "open" | "mitigated" | "accepted" | "closed";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-const ARCH_DIR = "architecture";
-const REQ_FILE = "01_REQUIREMENTS.md";
-const RISK_FILE = "02_RISK_REGISTER.md";
-
-function cwd(): string {
-  return process.cwd();
+interface Lifecycle {
+  nfrCount: number;
+  teamSize: number;
 }
 
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
+// ─── Operations ──────────────────────────────────────────────────────────────
+
+function nextId(prefix: string, existing: any[]): string {
+  const n = existing.filter((x) => String(x.id || "").startsWith(prefix)).length + 1;
+  return `${prefix}-${String(n).padStart(3, "0")}`;
 }
 
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
+export function addRequirement(
+  state: FleetState,
+  input: Partial<Requirement>
+): { ok: boolean; message: string; requirement?: Requirement } {
+  const list = state.requirements || (state.requirements = []);
+  if (!input.description?.trim()) return { ok: false, message: "description is required" };
+
+  const type = input.type === "non-functional" ? "non-functional" : "functional";
+  const req: Requirement = {
+    id: input.id?.trim() || nextId(type === "functional" ? "REQ" : "NFR", list),
+    type,
+    category: input.category?.trim() || "general",
+    description: input.description.trim(),
+    source: input.source?.trim() || "unspecified",
+    priority: (["critical", "high", "medium", "low"] as const).includes(input.priority as any)
+      ? (input.priority as any)
+      : "medium",
+    status: "proposed",
+  };
+
+  if (list.some((r) => r.id === req.id)) {
+    return { ok: false, message: `${req.id} already exists` };
+  }
+  list.push(req);
+  saveState(state);
+  writeRequirementsFile(state);
+  audit(`requirement added ${req.id}`, state);
+  return { ok: true, message: `${req.id} recorded (${req.priority})`, requirement: req };
 }
 
-// ─── Write Requirements ──────────────────────────────────────────────────────
+export function addRisk(state: FleetState, input: Partial<Risk>): { ok: boolean; message: string; risk?: Risk } {
+  const list = state.risks || (state.risks = []);
+  if (!input.title?.trim()) return { ok: false, message: "title is required" };
 
-function writeRequirementsFile(
-  requirements: Requirement[],
-  lifecycle: string,
-  teamScale: string
-) {
+  const risk: Risk = {
+    id: input.id?.trim() || nextId("RSK", list),
+    title: input.title.trim(),
+    description: input.description?.trim() || "",
+    likelihood: (["high", "medium", "low"] as const).includes(input.likelihood as any)
+      ? (input.likelihood as any)
+      : "medium",
+    impact: (["high", "medium", "low"] as const).includes(input.impact as any) ? (input.impact as any) : "medium",
+    mitigation: input.mitigation?.trim() || "",
+    status: "open",
+  };
+
+  if (list.some((r) => r.id === risk.id)) return { ok: false, message: `${risk.id} already exists` };
+  list.push(risk);
+  saveState(state);
+  writeRiskFile(state);
+  audit(`risk added ${risk.id}`, state);
+  return { ok: true, message: `${risk.id} recorded (${risk.likelihood}/${risk.impact})`, risk };
+}
+
+// ─── Writers ─────────────────────────────────────────────────────────────────
+
+function writeRequirementsFile(state: FleetState) {
   ensureArchDir();
-  const funcReqs = requirements.filter((r) => r.type === "functional");
-  const nonFuncReqs = requirements.filter((r) => r.type === "non-functional");
-
+  const reqs = state.requirements || [];
+  if (reqs.length === 0) {
+    writeFileSync(archPath(REQ_FILE), "# Requirements\n\n*No requirements recorded yet.*\n", "utf8");
+    return;
+  }
+  const life = state.lifecycle || { nfrCount: reqs.filter((r) => r.type === "non-functional").length, teamSize: 0 };
   const lines = [
     "# Requirements",
     "",
     `*Generated by fleet-requirements · ${new Date().toISOString()}*`,
     "",
-    "## Expected System Lifetime",
-    lifecycle || "_not specified_",
+    `Functional: ${reqs.filter((r) => r.type === "functional").length} · Non-functional: ${life.nfrCount} · Team size: ${life.teamSize || "unset"}`,
     "",
-    "## Expected Team/Fleet Scalability",
-    teamScale || "_not specified_",
-    "",
-    "---",
-    "",
+    "| ID | Type | Category | Priority | Status | Description |",
+    "|---|---|---|---|---|---|",
   ];
-
-  if (funcReqs.length > 0) {
-    lines.push("## Functional Requirements", "");
-    for (const r of funcReqs) {
-      lines.push(`### ${r.id} [${r.priority}]`);
-      lines.push(`**Category:** ${r.category}`);
-      lines.push(`**Source:** ${r.source}`);
-      lines.push(`**Status:** ${r.status}`);
-      lines.push("");
-      lines.push(r.description);
-      lines.push("");
-    }
+  for (const r of reqs) {
+    lines.push(`| ${r.id} | ${r.type} | ${r.category} | ${r.priority} | ${r.status} | ${r.description.slice(0, 80)} |`);
   }
-
-  if (nonFuncReqs.length > 0) {
-    lines.push("## Non-Functional Requirements", "");
-    for (const r of nonFuncReqs) {
-      lines.push(`### ${r.id} [${r.priority}]`);
-      lines.push(`**Category:** ${r.category}`);
-      lines.push(`**Source:** ${r.source}`);
-      lines.push(`**Status:** ${r.status}`);
-      lines.push("");
-      lines.push(r.description);
-      lines.push("");
-    }
-  }
-
-  if (requirements.length === 0) {
-    lines.push("*No requirements recorded yet.*");
+  lines.push("", "---", "");
+  for (const r of reqs) {
+    lines.push(`## ${r.id} — ${r.description}`, "");
+    lines.push(`**Type:** ${r.type}  **Priority:** ${r.priority}  **Status:** ${r.status}`);
+    lines.push(`**Category:** ${r.category}  **Source:** ${r.source}`);
+    lines.push("");
+    lines.push("---");
     lines.push("");
   }
-
   writeFileSync(archPath(REQ_FILE), lines.join("\n"), "utf8");
 }
 
-// ─── Write Risk Register ─────────────────────────────────────────────────────
-
-function writeRiskFile(risks: Risk[]) {
+function writeRiskFile(state: FleetState) {
   ensureArchDir();
+  const risks = state.risks || [];
   if (risks.length === 0) {
-    writeFileSync(
-      archPath(RISK_FILE),
-      "# Risk Register\n\n*No risks recorded yet.*\n",
-      "utf8"
-    );
+    writeFileSync(archPath(RISK_FILE), "# Risk Register\n\n*No risks recorded yet.*\n", "utf8");
     return;
   }
-
   const lines = [
     "# Risk Register",
     "",
@@ -139,304 +159,153 @@ function writeRiskFile(risks: Risk[]) {
     "| ID | Title | Likelihood | Impact | Status | Mitigation |",
     "|---|---|---|---|---|---|",
   ];
-
   for (const r of risks) {
-    lines.push(
-      `| ${r.id} | ${r.title} | ${r.likelihood} | ${r.impact} | ${r.status} | ${r.mitigation} |`
-    );
+    lines.push(`| ${r.id} | ${r.title} | ${r.likelihood} | ${r.impact} | ${r.status} | ${r.mitigation.slice(0, 60)} |`);
   }
-
-  lines.push("");
-  lines.push("---");
-  lines.push("");
-
+  lines.push("", "---", "");
   for (const r of risks) {
-    lines.push(`## ${r.id} — ${r.title}`);
+    lines.push(`## ${r.id} — ${r.title}`, "");
     lines.push(`**Likelihood:** ${r.likelihood}  **Impact:** ${r.impact}  **Status:** ${r.status}`);
     lines.push("");
     lines.push(r.description);
     lines.push("");
-    lines.push(`**Mitigation:** ${r.mitigation}`);
+    lines.push(`**Mitigation:** ${r.mitigation || "_none recorded_"}`);
+    lines.push("");
     lines.push("---");
     lines.push("");
   }
-
   writeFileSync(archPath(RISK_FILE), lines.join("\n"), "utf8");
-}
-
-// ─── Load fleet state for gate check ─────────────────────────────────────────
-
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try {
-      return JSON.parse(readFileSync(jsonPath, "utf8"));
-    } catch {
-      return null;
-    }
-  }
-  return null;
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let requirements: Requirement[] = [];
-  let risks: Risk[] = [];
-  let lifecycle = "";
-  let teamScale = "";
-
-  // Restore state on session start
-  pi.on("session_start", async () => {
-    const jsonPath = archPath("fleet-state.json");
-    const statePath = archPath("req-state.json");
-    if (existsSync(statePath)) {
-      try {
-        const saved = JSON.parse(readFileSync(statePath, "utf8"));
-        requirements = saved.requirements || [];
-        risks = saved.risks || [];
-        lifecycle = saved.lifecycle || "";
-        teamScale = saved.teamScale || "";
-      } catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  // ─── Helper: gate check for Phase 1 ─────────────────────────────────────
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state || !fleet.state.job || !fleet.state.job.objective) {
-      ctx.ui.notify("No job initialized. Run /fleet:new-job first (Phase 0).", "warning");
-      return false;
-    }
-    if (!fleet.state.phaseGates?.[0]) {
-      ctx.ui.notify("Phase 0 (JOB DEFINITION) not complete. Advance to Phase 1 first with /fleet:phase 1.", "warning");
-      return false;
-    }
-    return true;
-  }
-
-  // ─── Save state ─────────────────────────────────────────────────────────
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(
-      archPath("req-state.json"),
-      JSON.stringify({ requirements, risks, lifecycle, teamScale }, null, 2),
-      "utf8"
-    );
-    writeRequirementsFile(requirements, lifecycle, teamScale);
-    writeRiskFile(risks);
-  }
-
-  // ─── Command: fleet:requirements ────────────────────────────────────────
 
   pi.registerCommand("fleet:requirements", {
-    description: "Extract requirements (Phase 1) — guides through functional + non-functional",
-    handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify("Starting requirements extraction. Answer prompts to build the requirements document.", "info");
-
-      // System lifetime
-      const life = await ctx.ui.input(
-        "Expected system lifetime (e.g., '5 years', '10+ years')",
-        lifecycle || "5 years"
-      );
-      if (life) lifecycle = life;
-
-      // Team/scale expectations
-      const scale = await ctx.ui.input(
-        "Expected team/fleet scalability (e.g., '3 agents', '10+ agents')",
-        teamScale || "3 agents"
-      );
-      if (scale) teamScale = scale;
-
-      // Functional requirements — loop until user stops
-      let addMore = true;
-      while (addMore) {
-        const desc = await ctx.ui.input(
-          `Functional requirement #${requirements.filter((r) => r.type === "functional").length + 1} (or leave blank to stop)`,
-          ""
-        );
-        if (!desc) { addMore = false; break; }
-
-        const cat = await ctx.ui.input("Category (e.g., 'data ingestion', 'search', 'storage')", "general");
-        const priorityRaw = await ctx.ui.select("Priority", [
-          { label: "Critical", value: "critical" },
-          { label: "High", value: "high" },
-          { label: "Medium", value: "medium" },
-          { label: "Low", value: "low" },
-        ]);
-        const priority = priorityRaw || "medium";
-
-        requirements.push({
-          id: `FR-${String(requirements.filter((r) => r.type === "functional").length + 1).padStart(3, "0")}`,
-          type: "functional",
-          category: cat || "general",
-          description: desc,
-          source: "user input",
-          priority: priority as any,
-          status: "proposed",
-        });
-        ctx.ui.notify(`📝 Added functional requirement — ${requirements.length} total`, "info");
-
-        const more = await ctx.ui.confirm("Add another functional requirement?", "");
-        if (!more) addMore = false;
+    description: "Extract requirements (Phase 1)",
+    handler: async (args, ctx) => {
+      const state = loadState();
+      if (!state.job.objective) {
+        ctx.ui.notify("No job. Run /fleet:new-job first.", "warning");
+        return;
       }
-
-      // Non-functional requirements
-      addMore = true;
-      while (addMore) {
-        const desc = await ctx.ui.input(
-          `Non-functional requirement #${requirements.filter((r) => r.type === "non-functional").length + 1} (or blank to stop)`,
-          ""
-        );
-        if (!desc) { addMore = false; break; }
-
-        const cat = await ctx.ui.input("Category (e.g., 'performance', 'security', 'reliability')", "quality");
-        const priorityRaw = await ctx.ui.select("Priority", [
-          { label: "Critical", value: "critical" },
-          { label: "High", value: "high" },
-          { label: "Medium", value: "medium" },
-          { label: "Low", value: "low" },
-        ]);
-
-        requirements.push({
-          id: `NFR-${String(requirements.filter((r) => r.type === "non-functional").length + 1).padStart(3, "0")}`,
-          type: "non-functional",
-          category: cat || "quality",
-          description: desc,
-          source: "user input",
-          priority: (priorityRaw || "medium") as any,
-          status: "proposed",
-        });
-        ctx.ui.notify(`📝 Added non-functional requirement — ${requirements.length} total`, "info");
-
-        const more = await ctx.ui.confirm("Add another non-functional requirement?", "");
-        if (!more) addMore = false;
+      const blocked = gateForPhase(state, 1);
+      if (blocked.length > 0 && state.currentPhase < 1) {
+        ctx.ui.notify(`Phase 1 is gated:\n${blocked.map((b) => `· ${b}`).join("\n")}`, "error");
+        return;
       }
-
-      saveState();
-      ctx.ui.notify(
-        `✅ Requirements written: ${requirements.filter((r) => r.type === "functional").length} functional, ${requirements.filter((r) => r.type === "non-functional").length} non-functional`,
-        "info"
-      );
+      const count = parseInt(args?.trim() || "5", 10);
+      let added = 0;
+      for (let i = 0; i < count; i++) {
+        const description = await ctx.ui.input(`Requirement ${i + 1}/${count}`, "");
+        if (!description) break;
+        const category = await ctx.ui.input("Category", "general");
+        const res = addRequirement(state, { description, category });
+        if (res.ok) added++;
+        else ctx.ui.notify(res.message, "warning");
+      }
+      ctx.ui.notify(`[fleet] ${added} requirement(s) recorded.`, "info");
     },
   });
-
-  // ─── Command: fleet:risks ──────────────────────────────────────────────
 
   pi.registerCommand("fleet:risks", {
-    description: "Build risk register (Phase 1) — guides through identifying risks",
+    description: "Build the risk register (Phase 1)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify("Starting risk identification. Consider: failure points, migration risks, dependency risks, extensibility risks.", "info");
-
-      let addMore = true;
-      while (addMore) {
-        const title = await ctx.ui.input(
-          `Risk #${risks.length + 1} title (or blank to stop)`,
-          ""
-        );
-        if (!title) { addMore = false; break; }
-
-        const desc = await ctx.ui.input("Description", "");
-        const likelihoodRaw = await ctx.ui.select("Likelihood", [
-          { label: "High", value: "high" },
-          { label: "Medium", value: "medium" },
-          { label: "Low", value: "low" },
-        ]);
-        const impactRaw = await ctx.ui.select("Impact", [
-          { label: "High", value: "high" },
-          { label: "Medium", value: "medium" },
-          { label: "Low", value: "low" },
-        ]);
-        const mitigation = await ctx.ui.input("Mitigation strategy", "");
-
-        risks.push({
-          id: `RISK-${String(risks.length + 1).padStart(3, "0")}`,
-          title,
-          description: desc || title,
-          likelihood: (likelihoodRaw || "medium") as any,
-          impact: (impactRaw || "medium") as any,
-          mitigation: mitigation || "_not specified_",
-          status: "open",
-        });
-        ctx.ui.notify(`⚠️  Added risk: "${title}" — ${risks.length} total`, "info");
-
-        const more = await ctx.ui.confirm("Add another risk?", "");
-        if (!more) addMore = false;
+      const state = loadState();
+      let added = 0;
+      for (;;) {
+        const title = await ctx.ui.input("Risk title (blank to finish)", "");
+        if (!title) break;
+        const likelihood = await ctx.ui.input("Likelihood (high/medium/low)", "medium");
+        const impact = await ctx.ui.input("Impact (high/medium/low)", "medium");
+        const mitigation = await ctx.ui.input("Mitigation", "");
+        const res = addRisk(state, { title, likelihood: likelihood as any, impact: impact as any, mitigation });
+        if (res.ok) added++;
       }
-
-      saveState();
-      ctx.ui.notify(`✅ Risk register written: ${risks.length} risks identified`, "info");
+      ctx.ui.notify(`[fleet] ${added} risk(s) recorded.`, "info");
     },
   });
 
-  // ─── Command: fleet:add-req ────────────────────────────────────────────
-
   pi.registerCommand("fleet:add-req", {
-    description: "Manually add a requirement (usage: /fleet:add-req <type> <description>)",
+    description: "Manually add a requirement (/fleet:add-req <type> <description>)",
     handler: async (args, ctx) => {
-      if (!checkGate(ctx)) return;
-      if (!args?.trim()) {
+      const parts = (args || "").trim().split(/\s+/);
+      if (parts.length < 2) {
         ctx.ui.notify("Usage: /fleet:add-req <functional|non-functional> <description>", "warning");
         return;
       }
-      const parts = args.trim().split(/\s+/);
-      const typeRaw = parts[0].toLowerCase();
-      if (typeRaw !== "functional" && typeRaw !== "non-functional") {
-        ctx.ui.notify("First argument must be 'functional' or 'non-functional'", "warning");
-        return;
-      }
-      const type = typeRaw as "functional" | "non-functional";
-      const desc = parts.slice(1).join(" ");
-      if (!desc) {
-        ctx.ui.notify("Description required.", "warning");
-        return;
-      }
-
-      const prefix = type === "functional" ? "FR" : "NFR";
-      const count = requirements.filter((r) => r.type === type).length + 1;
-
-      requirements.push({
-        id: `${prefix}-${String(count).padStart(3, "0")}`,
-        type,
-        category: "manual",
-        description: desc,
-        source: "manual",
-        priority: "medium",
-        status: "proposed",
+      const res = addRequirement(loadState(), {
+        type: parts[0] === "non-functional" ? "non-functional" : "functional",
+        description: parts.slice(1).join(" "),
       });
-
-      saveState();
-      ctx.ui.notify(`📝 Added ${type} requirement: "${desc.slice(0, 60)}..."`, "info");
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
     },
   });
 
-  // ─── Command: fleet:add-risk ───────────────────────────────────────────
-
   pi.registerCommand("fleet:add-risk", {
-    description: "Manually add a risk (usage: /fleet:add-risk <title> — <description>)",
+    description: "Manually add a risk (/fleet:add-risk <title> — <description>)",
     handler: async (args, ctx) => {
-      if (!checkGate(ctx)) return;
-      if (!args?.trim()) {
+      const raw = (args || "").trim();
+      if (!raw) {
         ctx.ui.notify("Usage: /fleet:add-risk <title> — <description>", "warning");
         return;
       }
-      risks.push({
-        id: `RISK-${String(risks.length + 1).padStart(3, "0")}`,
-        title: args.trim().split(/ — /)?.[0] || args.trim(),
-        description: args.trim().split(/ — /)?.[1] || "",
-        likelihood: "medium",
-        impact: "medium",
-        mitigation: "_pending_",
-        status: "open",
-      });
-      saveState();
-      ctx.ui.notify(`⚠️  Added risk: "${risks[risks.length - 1].title}"`, "info");
+      const [title, ...rest] = raw.split(/\s+—\s+/);
+      const res = addRisk(loadState(), { title, description: rest.join(" ") });
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_add_requirement",
+    label: "Add Requirement",
+    description:
+      "Record a functional or non-functional requirement. Use this instead of writing 01_REQUIREMENTS.md by hand — the registry is the source of truth and Phase 1's gate reads it.",
+    parameters: Type.Object({
+      description: Type.String({ description: "What the system must do or guarantee" }),
+      type: Type.Optional(
+        Type.Union([Type.Literal("functional"), Type.Literal("non-functional")], {
+          description: "Defaults to functional",
+        })
+      ),
+      category: Type.Optional(Type.String({ description: "Grouping, e.g. storage, api, security" })),
+      priority: Type.Optional(
+        Type.Union(
+          [Type.Literal("critical"), Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")],
+          { description: "Defaults to medium" }
+        )
+      ),
+      source: Type.Optional(Type.String({ description: "Where the requirement came from" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addRequirement(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_add_risk",
+    label: "Add Risk",
+    description: "Record a risk against the architecture, with likelihood, impact, and mitigation.",
+    parameters: Type.Object({
+      title: Type.String({ description: "Short risk title" }),
+      description: Type.Optional(Type.String()),
+      likelihood: Type.Optional(
+        Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")])
+      ),
+      impact: Type.Optional(Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")])),
+      mitigation: Type.Optional(Type.String({ description: "How the risk is contained" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addRisk(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
     },
   });
 }

@@ -1,160 +1,39 @@
 /**
- * fleet-orchestrator :: [MACRO] Phase 0 — Job Init + Fleet State Machine
+ * fleet-orchestrator :: Phase 0 — Job Init + Fleet State Machine
  *
- * The orchestrator extension for the Macro Architecture Fleet.
- * Maintains phase state, job definition, and dependency graph across sessions.
- * All other fleet agents register against this extension's phase gates.
+ * Owns the canonical store, phase transitions, the decision queue, and
+ * contract freeze. Every phase transition is gated on artifacts that actually
+ * exist on disk (see fleet-core `gateForPhase`), not on bookkeeping booleans.
  *
- * /fleet:new-job       — initialize architecture/00_JOB.md with objective/scope/non-goals
- * /fleet:status        — show current phase, ready/blocked/decision queues
- * /fleet:phase <n>     — advance phase (checks gates first)
- * /fleet:decision <id> — record or resolve a decision
+ * Commands (human-paced):
+ *   /fleet:new-job        initialize a job (Phase 0)
+ *   /fleet:status         show phase, artifacts, gates
+ *   /fleet:phase <n>      advance to phase n (gated)
+ *   /fleet:decision <id> <topic> | resolve <id> <option> | list
+ *   /fleet:contract-freeze  freeze contracts (Phase 9+)
+ *   /fleet:audit          replay the enforcement log
+ *   /fleet:override <rule> <reason>   record a deliberate gate bypass
  *
- * State persists via pi.appendEntry() + architecture/fleet-state.json.
- * Artifacts live in architecture/ directory (never writes code).
+ * Tools (agent-paced): fleet_status, fleet_advance_phase, fleet_record_decision,
+ * fleet_resolve_decision, fleet_freeze_contracts.
+ *
+ * Usage: pi -e extensions/fleet-orchestrator.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { Type } from "@sinclair/typebox";
+import {
+  PHASES, MAX_PHASE, FREEZE_PHASE,
+  JOB_FILE, DECISION_FILE, AUDIT_FILE, OVERRIDE_FILE,
+  archPath, ensureArchDir,
+  loadState, saveState, audit, emptyState,
+  gateForPhase, artifactStatus, installEnforcement, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState, Decision } from "./fleet-core.ts";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-const STATE_TYPE = "fleet-state";
-
-const PHASES = [
-  { n: 0, label: "JOB DEFINITION" },
-  { n: 1, label: "REQUIREMENTS + RISKS" },
-  { n: 2, label: "PRIMITIVE" },
-  { n: 3, label: "FORMATS + CONTRACTS" },
-  { n: 4, label: "MODULE BOUNDARIES" },
-  { n: 5, label: "DEPENDENCIES + EXTENSIONS" },
-  { n: 6, label: "TOOLING + MIGRATION" },
-  { n: 7, label: "ARCHITECTURE VERIFICATION" },
-  { n: 8, label: "USER DECISIONS" },
-  { n: 9, label: "CONTRACT FREEZE" },
-  { n: 10, label: "PARALLEL IMPLEMENTATION" },
-  { n: 11, label: "INTEGRATION + REPLACEMENT TEST" },
-] as const;
-
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-interface FleetState {
-  job: {
-    objective: string;
-    scope: string[];
-    non_goals: string[];
-    source_material: string[];
-    existing_system: string;
-    known_constraints: string[];
-    decision_authority: "director" | "fleet" | "auto";
-  };
-  currentPhase: number;
-  readyTasks: string[];
-  runningTasks: string[];
-  blockedTasks: string[];
-  decisionsRequired: string[];
-  frozenContracts: string[];
-  phaseGates: Record<number, boolean>;
-}
-
-interface Decision {
-  id: string;
-  topic: string;
-  trigger: { reason: string };
-  requirements: string[];
-  options: {
-    option: string;
-    benefits: string[];
-    costs: string[];
-    constraints: string[];
-  }[];
-  recommendation: { option: string; rationale: string };
-  status: "awaiting_user_decision" | "approved" | "rejected";
-  selectedOption: string | null;
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-const ARCH_DIR = "architecture";
-const JOB_FILE = "00_JOB.md";
-const DECISION_FILE = "12_DECISION_REGISTER.md";
-
-function cwd(): string {
-  return process.cwd();
-}
-
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
-}
-
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
-}
-
-function emptyState(): FleetState {
-  return {
-    job: {
-      objective: "",
-      scope: [],
-      non_goals: [],
-      source_material: [],
-      existing_system: "",
-      known_constraints: [],
-      decision_authority: "director",
-    },
-    currentPhase: 0,
-    readyTasks: [],
-    runningTasks: [],
-    blockedTasks: [],
-    decisionsRequired: [],
-    frozenContracts: [],
-    phaseGates: { 0: false },
-  };
-}
-
-// ─── Phase gate checks ─────────────────────────────────────────────────────
-
-function gateForPhase(state: FleetState, n: number): string[] {
-  const missed: string[] = [];
-  switch (n) {
-    case 0:
-      if (!state.job.objective) missed.push("job objective not set");
-      if (state.job.scope.length === 0) missed.push("job scope not defined");
-      break;
-    case 1:
-      if (!state.phaseGates[0]) missed.push("Phase 0 (JOB DEFINITION) not complete");
-      break;
-    case 2:
-      if (!state.phaseGates[1]) missed.push("Phase 1 (REQUIREMENTS + RISKS) not complete");
-      break;
-    case 3:
-      if (!state.phaseGates[2]) missed.push("Phase 2 (PRIMITIVE) not complete");
-      break;
-    case 4:
-      if (!state.phaseGates[3]) missed.push("Phase 3 (FORMATS + CONTRACTS) not complete");
-      break;
-    case 5:
-      if (!state.phaseGates[4]) missed.push("Phase 4 (MODULE BOUNDARIES) not complete");
-      break;
-    case 6:
-      if (!state.phaseGates[5]) missed.push("Phase 5 (DEPENDENCIES + EXTENSIONS) not complete");
-      break;
-    case 7:
-      if (!state.phaseGates[6]) missed.push("Phase 6 (TOOLING + MIGRATION) not complete");
-      break;
-    case 9:
-      if (state.decisionsRequired.length > 0) missed.push("unresolved decisions exist");
-      break;
-    case 10:
-      if (!state.phaseGates[9]) missed.push("Phase 9 (CONTRACT FREEZE) not complete");
-      break;
-  }
-  return missed;
-}
-
-// ─── Write JOB.md ─────────────────────────────────────────────────────────
+// ─── Writers ─────────────────────────────────────────────────────────────────
 
 function writeJobFile(state: FleetState) {
   ensureArchDir();
@@ -179,26 +58,24 @@ function writeJobFile(state: FleetState) {
     "## Known Constraints",
     ...state.job.known_constraints.map((s) => `- ${s}`),
     "",
-    `## Decision Authority`,
+    "## Decision Authority",
     state.job.decision_authority,
     "",
     "---",
-    `*Created by fleet-orchestrator · Phase ${state.currentPhase}*`,
+    `*Created by fleet-orchestrator · ${new Date().toISOString()}*`,
   ];
   writeFileSync(archPath(JOB_FILE), lines.join("\n"), "utf8");
 }
 
-// ─── Write DECISION_REGISTER.md ──────────────────────────────────────────
-
 function writeDecisionFile(decisions: Record<string, Decision>) {
   ensureArchDir();
-  const decisionEntries = Object.values(decisions);
-  if (decisionEntries.length === 0) {
+  const entries = Object.values(decisions);
+  if (entries.length === 0) {
     writeFileSync(archPath(DECISION_FILE), "# Decision Register\n\n*No decisions recorded yet.*\n", "utf8");
     return;
   }
   const lines = ["# Decision Register", ""];
-  for (const d of decisionEntries) {
+  for (const d of entries) {
     lines.push(`## ${d.id} — ${d.topic}`);
     lines.push(`**Status:** ${d.status}`);
     if (d.trigger?.reason) lines.push(`**Trigger:** ${d.trigger.reason}`);
@@ -223,47 +100,153 @@ function writeDecisionFile(decisions: Record<string, Decision>) {
   writeFileSync(archPath(DECISION_FILE), lines.join("\n"), "utf8");
 }
 
-// ─── Save/Load ─────────────────────────────────────────────────────────────
-
-function saveState(state: FleetState, decisions: Record<string, Decision>, pi: ExtensionAPI) {
-  ensureArchDir();
-  const payload = JSON.stringify({ state, decisions }, null, 2);
-  writeFileSync(archPath("fleet-state.json"), payload, "utf8");
+function writeOverrides(state: FleetState) {
+  writeFileSync(
+    archPath(OVERRIDE_FILE),
+    JSON.stringify(state.overrides, null, 2),
+    "utf8"
+  );
 }
 
-function loadState(): { state: FleetState; decisions: Record<string, Decision> } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try {
-      return JSON.parse(readFileSync(jsonPath, "utf8"));
-    } catch {
-      /* corrupt — return null */
+// ─── Operations (shared by commands and tools) ───────────────────────────────
+
+function advancePhase(state: FleetState, target: number): { ok: boolean; message: string } {
+  if (!state.job.objective) return { ok: false, message: "No job initialized. Run /fleet:new-job first." };
+  if (isNaN(target) || target < 0 || target > MAX_PHASE) {
+    return { ok: false, message: `Target out of range. Use 0-${MAX_PHASE}.` };
+  }
+  if (target === state.currentPhase) {
+    return { ok: false, message: `Already in Phase ${target}.` };
+  }
+  if (target < state.currentPhase) {
+    // Rewind is permitted only if nothing downstream depends on it.
+    if (target < FREEZE_PHASE && state.currentPhase >= FREEZE_PHASE) {
+      return {
+        ok: false,
+        message: "Contracts are frozen; rewind is blocked. Open a decision instead.",
+      };
     }
   }
-  return null;
+
+  const gate = gateForPhase(state, target);
+  if (gate.length > 0) {
+    return {
+      ok: false,
+      message: `Cannot advance to Phase ${target} (${PHASES[target].label}). Gate blocked:\n` +
+        gate.map((g) => `  · ${g}`).join("\n"),
+    };
+  }
+
+  state.currentPhase = target;
+  // Record that the phase was genuinely cleared — derived from artifacts, not
+  // seeded as a side effect of the advance itself.
+  state.phaseGates[target] = true;
+  saveState(state);
+  audit(`advance -> phase ${target} (${PHASES[target].label})`, state);
+  return { ok: true, message: `Advanced to Phase ${target}: ${PHASES[target].label}` };
 }
 
-// ─── Extension Export ─────────────────────────────────────────────────────
+function recordDecision(state: FleetState, id: string, topic: string): { ok: boolean; message: string } {
+  if (state.decisions?.[id]) {
+    return { ok: false, message: `Decision ${id} already exists. Use 'resolve' to approve it.` };
+  }
+  state.decisions = state.decisions || {};
+  state.decisions[id] = {
+    id,
+    topic,
+    trigger: { reason: "" },
+    requirements: [],
+    options: [],
+    recommendation: { option: "", rationale: "" },
+    status: "awaiting_user_decision",
+    selectedOption: null,
+  };
+  if (!state.decisionsRequired.includes(id)) state.decisionsRequired.push(id);
+  saveState(state);
+  writeDecisionFile(state.decisions);
+  audit(`decision recorded ${id}: ${topic}`, state);
+  return { ok: true, message: `Decision ${id} recorded: "${topic}" — awaiting human resolution` };
+}
+
+function resolveDecision(state: FleetState, id: string, option: string): { ok: boolean; message: string } {
+  const d = state.decisions?.[id];
+  if (!d) return { ok: false, message: `Decision ${id} not found.` };
+  if (!option) return { ok: false, message: "Specify the selected option." };
+  d.status = "approved";
+  d.selectedOption = option;
+  state.decisionsRequired = state.decisionsRequired.filter((x) => x !== id);
+  saveState(state);
+  writeDecisionFile(state.decisions);
+  audit(`decision resolved ${id} -> ${option}`, state);
+  return { ok: true, message: `${id}: approved — "${option}"` };
+}
+
+function freezeContracts(state: FleetState, contractId: string, version: string): { ok: boolean; message: string } {
+  if (state.currentPhase < FREEZE_PHASE) {
+    return {
+      ok: false,
+      message: `Cannot freeze in Phase ${state.currentPhase}. Advance to Phase ${FREEZE_PHASE} first.`,
+    };
+  }
+  if (state.decisionsRequired.length > 0) {
+    return {
+      ok: false,
+      message: `Unresolved decisions block the freeze: ${state.decisionsRequired.join(", ")}`,
+    };
+  }
+  if (state.frozenContracts.includes(contractId)) {
+    return { ok: false, message: `${contractId} is already frozen.` };
+  }
+  state.frozenContracts.push(contractId);
+  saveState(state);
+  audit(`contract frozen ${contractId} v${version}`, state);
+  return { ok: true, message: `Contract frozen: ${contractId} v${version}` };
+}
+
+function statusReport(state: FleetState): string {
+  const phase = PHASES[state.currentPhase];
+  const lines = [
+    `📋 Fleet State (Phase ${state.currentPhase}: ${phase.label})`,
+    `  Objective: ${state.job.objective || "(not set)"}`,
+    `  Scope: ${state.job.scope.length} · Non-goals: ${state.job.non_goals.length}`,
+    `  Decisions required: ${state.decisionsRequired.length || "0"}`,
+    `  Frozen contracts: ${state.frozenContracts.length || "0"}`,
+    `  Overrides: ${state.overrides.length || "0"}`,
+    "",
+    "  Artifacts:",
+  ];
+  for (const a of artifactStatus()) {
+    lines.push(`    ${a.ok ? "✅" : "⬜"} [P${a.phase}] ${a.file}`);
+  }
+  const next = state.currentPhase + 1;
+  if (next <= MAX_PHASE) {
+    const gate = gateForPhase(state, next);
+    lines.push("");
+    if (gate.length === 0) {
+      lines.push(`  ✅ Gate clear for Phase ${next} (${PHASES[next].label})`);
+    } else {
+      lines.push(`  ⛔ Gate blocked for Phase ${next}:`);
+      for (const g of gate) lines.push(`    · ${g}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let state: FleetState = emptyState();
-  let decisions: Record<string, Decision> = {};
+  // The write gate and the phase banner are installed once, here, so every
+  // phase extension inherits them without re-registering the hooks.
+  installEnforcement(pi);
 
-  // ─── Restore state on session start ─────────────────────────────────────
-
-  pi.on("session_start", async (_event, ctx) => {
-    const loaded = loadState();
-    if (loaded) {
-      state = loaded.state;
-      decisions = loaded.decisions;
-      ctx.ui.notify(
-        `[fleet] restored: Phase ${state.currentPhase} — ${state.job.objective || "(no job)"}`,
-        "info"
-      );
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const state = loadState();
+    const brief = phaseBrief(state);
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
 
-  // ─── Command: fleet:new-job ─────────────────────────────────────────────
+  // ─── Commands ─────────────────────────────────────────────────────────────
 
   pi.registerCommand("fleet:new-job", {
     description: "Initialize a new architecture job (Phase 0)",
@@ -272,204 +255,230 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /fleet:new-job <objective>", "warning");
         return;
       }
+      const state = loadState();
       if (state.job.objective) {
-        const ok = await ctx.ui.confirm(
-          "Replace existing job?",
-          `Current: "${state.job.objective}"`
-        );
+        const ok = await ctx.ui.confirm("Replace existing job?", `Current: "${state.job.objective}"`);
         if (!ok) return;
       }
-      state = emptyState();
-      decisions = {};
-      state.job.objective = args.trim();
+      const fresh = emptyState();
+      fresh.job.objective = args.trim();
 
-      const scopeInput = await ctx.ui.input("Scope items (comma-separated)", "");
-      if (scopeInput) state.job.scope = scopeInput.split(",").map((s: string) => s.trim()).filter(Boolean);
+      const scope = await ctx.ui.input("Scope items (comma-separated)", "");
+      if (scope) fresh.job.scope = scope.split(",").map((s) => s.trim()).filter(Boolean);
+      const ng = await ctx.ui.input("Non-goals (comma-separated)", "");
+      if (ng) fresh.job.non_goals = ng.split(",").map((s) => s.trim()).filter(Boolean);
+      const src = await ctx.ui.input("Source material (comma-separated)", "");
+      if (src) fresh.job.source_material = src.split(",").map((s) => s.trim()).filter(Boolean);
+      const con = await ctx.ui.input("Known constraints (comma-separated)", "");
+      if (con) fresh.job.known_constraints = con.split(",").map((s) => s.trim()).filter(Boolean);
 
-      const ngInput = await ctx.ui.input("Non-goals (comma-separated)", "");
-      if (ngInput) state.job.non_goals = ngInput.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-      const srcInput = await ctx.ui.input("Source material (comma-separated)", "");
-      if (srcInput) state.job.source_material = srcInput.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-      const conInput = await ctx.ui.input("Known constraints (comma-separated)", "");
-      if (conInput) state.job.known_constraints = conInput.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-      writeJobFile(state);
-      saveState(state, decisions, pi);
-      ctx.ui.notify(`[fleet] Job created: "${state.job.objective}"`, "info");
+      saveState(fresh);
+      writeJobFile(fresh);
+      audit(`job created: ${fresh.job.objective}`, fresh);
+      ctx.ui.notify(`[fleet] Job created: "${fresh.job.objective}"`, "info");
     },
   });
-
-  // ─── Command: fleet:status ─────────────────────────────────────────────
 
   pi.registerCommand("fleet:status", {
-    description: "Show fleet state machine status",
+    description: "Show fleet state, artifacts, and gate status",
     handler: async (_args, ctx) => {
-      const phase = PHASES[state.currentPhase];
-      const lines = [
-        `📋 Fleet State (Phase ${state.currentPhase}: ${phase.label})`,
-        `  Objective: ${state.job.objective || "(not set)"}`,
-        `  Scope: ${state.job.scope.length} items`,
-        `  Non-goals: ${state.job.non_goals.length} items`,
-        `  Tasks — ready:${state.readyTasks.length} running:${state.runningTasks.length} blocked:${state.blockedTasks.length}`,
-        `  Decisions required: ${state.decisionsRequired.length}`,
-        `  Frozen contracts: ${state.frozenContracts.length}`,
-      ];
-      const gate = gateForPhase(state, state.currentPhase);
-      if (gate.length > 0) {
-        lines.push(`  ⛔ Gate blocked:`);
-        for (const g of gate) lines.push(`    · ${g}`);
-      } else if (state.job.objective) {
-        lines.push(`  ✅ Gate clear`);
+      const state = loadState();
+      if (!state.job.objective) {
+        ctx.ui.notify("No job initialized. Run /fleet:new-job <objective>.", "warning");
+        return;
       }
-      ctx.ui.notify(lines.join("\n"), "info");
+      ctx.ui.notify(statusReport(state), "info");
     },
   });
-
-  // ─── Command: fleet:phase ──────────────────────────────────────────────
 
   pi.registerCommand("fleet:phase", {
-    description: "Advance to phase [0-11] (checks gates)",
+    description: "Advance to phase [0-11] (checks artifact gates)",
     handler: async (args, ctx) => {
-      if (!state.job.objective) {
-        ctx.ui.notify("No job initialized. Run /fleet:new-job first.", "warning");
-        return;
-      }
-      let target = args?.trim() ? parseInt(args.trim(), 10) : state.currentPhase + 1;
-      if (isNaN(target) || target < 0 || target > 11) {
-        ctx.ui.notify("Usage: /fleet:phase [0-11]", "warning");
-        return;
-      }
-
-      // Check gate for target phase
-      const gate = gateForPhase(state, target);
-      if (gate.length > 0) {
-        ctx.ui.notify(
-          `⛔ Cannot advance to Phase ${target}. Gate blocked:\n${gate.map((g: string) => `  · ${g}`).join("\n")}`,
-          "error"
-        );
-        return;
-      }
-
-      state.currentPhase = target;
-      state.phaseGates[target] = true;
-      // If we passed phase 0, mark it as gated
-      if (target > 0) state.phaseGates[target - 1] = true;
-
-      saveState(state, decisions, pi);
-      ctx.ui.notify(`✅ Advanced to Phase ${target}: ${PHASES[target].label}`, "info");
+      const state = loadState();
+      const target = args?.trim() ? parseInt(args.trim(), 10) : state.currentPhase + 1;
+      const res = advancePhase(state, target);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
     },
   });
 
-  // ─── Command: fleet:decision ───────────────────────────────────────────
-
   pi.registerCommand("fleet:decision", {
-    description: "Record or resolve a decision (/fleet:decision <id> <topic> / fleet:decision resolve <id> <option>)",
+    description: "Record/resolve decisions (/fleet:decision <id> <topic> | resolve <id> <option> | list)",
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/);
-      if (parts.length < 2) {
-        ctx.ui.notify("Usage: /fleet:decision <id> <topic> | /fleet:decision resolve <id> <option> | /fleet:decision list", "warning");
-        return;
-      }
+      const state = loadState();
 
       if (parts[0] === "list") {
-        const entries = Object.values(decisions);
+        const entries = Object.values(state.decisions || {});
         if (entries.length === 0) {
           ctx.ui.notify("No decisions recorded.", "info");
           return;
         }
-        const lines = entries.map(
-          (d) => `${d.id}: ${d.topic} [${d.status}] → ${d.selectedOption || "?"}`
+        ctx.ui.notify(
+          entries.map((d) => `${d.id}: ${d.topic} [${d.status}] → ${d.selectedOption || "?"}`).join("\n"),
+          "info"
         );
-        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+      }
+
+      if (parts.length < 2) {
+        ctx.ui.notify("Usage: /fleet:decision <id> <topic> | resolve <id> <option> | list", "warning");
         return;
       }
 
       if (parts[0] === "resolve") {
-        const id = parts[1];
-        const option = parts.slice(2).join(" ");
-        const d = decisions[id];
-        if (!d) {
-          ctx.ui.notify(`Decision ${id} not found.`, "error");
-          return;
-        }
-        if (!option) {
-          ctx.ui.notify("Specify the selected option.", "warning");
-          return;
-        }
-        d.status = "approved";
-        d.selectedOption = option;
-        decisions[id] = d;
-        saveState(state, decisions, pi);
-        writeDecisionFile(decisions);
-
-        // Remove from decisionsRequired if present
-        state.decisionsRequired = state.decisionsRequired.filter((x) => x !== id);
-        saveState(state, decisions, pi);
-
-        ctx.ui.notify(`✅ ${id}: approved — "${option}"`, "info");
+        const res = resolveDecision(state, parts[1], parts.slice(2).join(" "));
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
         return;
       }
 
-      // Record a new decision
-      const id = parts[0];
-      if (decisions[id]) {
-        ctx.ui.notify(`Decision ${id} already exists. Use 'resolve' to approve.`, "warning");
-        return;
-      }
-      const topic = parts.slice(1).join(" ");
-      decisions[id] = {
-        id,
-        topic,
-        trigger: { reason: "" },
-        requirements: [],
-        options: [],
-        recommendation: { option: "", rationale: "" },
-        status: "awaiting_user_decision",
-        selectedOption: null,
-      };
-
-      // Add to decisions required
-      if (!state.decisionsRequired.includes(id)) {
-        state.decisionsRequired.push(id);
-      }
-
-      saveState(state, decisions, pi);
-      writeDecisionFile(decisions);
-      ctx.ui.notify(`[fleet] Decision ${id} recorded: "${topic}" — awaiting resolution`, "info");
+      const res = recordDecision(state, parts[0], parts.slice(1).join(" "));
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
     },
   });
 
-  // ─── Command: fleet:contract-freeze ────────────────────────────────────
-
   pi.registerCommand("fleet:contract-freeze", {
-    description: "Freeze contracts (Phase 9) — set contract status and version",
+    description: "Freeze contracts (Phase 9+) — makes design artifacts immutable",
     handler: async (args, ctx) => {
-      if (state.currentPhase < 9) {
-        ctx.ui.notify(`Cannot freeze contracts in Phase ${state.currentPhase}. Advance to Phase 9 first.`, "warning");
-        return;
-      }
-      if (state.decisionsRequired.length > 0) {
-        ctx.ui.notify("Unresolved decisions exist. Resolve them before freezing contracts.", "warning");
-        return;
-      }
+      const state = loadState();
       const version = args?.trim() || "1";
-      const contractId = await ctx.ui.input("Contract ID (e.g., core-api-v1)", "core-v1");
+      const contractId = await ctx.ui.input("Contract ID (e.g., core-api)", "core-v1");
       if (!contractId) {
         ctx.ui.notify("Contract freeze cancelled.", "info");
         return;
       }
-      const entry = {
-        id: contractId,
-        version: parseInt(version, 10),
-        frozenAt: new Date().toISOString(),
-      };
-      if (!state.frozenContracts.includes(contractId)) {
-        state.frozenContracts.push(contractId);
+      const res = freezeContracts(state, contractId, version);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+    },
+  });
+
+  pi.registerCommand("fleet:audit", {
+    description: "Replay the fleet enforcement log",
+    handler: async (_args, ctx) => {
+      const p = archPath(AUDIT_FILE);
+      if (!existsSync(p)) {
+        ctx.ui.notify("No audit entries yet.", "info");
+        return;
       }
-      saveState(state, decisions, pi);
-      ctx.ui.notify(`❄️ Contract frozen: ${contractId} v${version}`, "info");
+      const lines = readFileSync(p, "utf8").trim().split("\n");
+      ctx.ui.notify(lines.slice(-40).join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("fleet:override", {
+    description: "Record a deliberate gate bypass (/fleet:override <rule> <reason>)",
+    handler: async (args, ctx) => {
+      const parts = (args || "").trim().split(/\s+/);
+      if (parts.length < 2) {
+        ctx.ui.notify("Usage: /fleet:override <rule> <reason>", "warning");
+        return;
+      }
+      const state = loadState();
+      state.overrides.push({
+        at: new Date().toISOString(),
+        phase: state.currentPhase,
+        rule: parts[0],
+        reason: parts.slice(1).join(" "),
+      });
+      saveState(state);
+      writeOverrides(state);
+      audit(`override ${parts[0]}: ${parts.slice(1).join(" ")}`, state);
+      ctx.ui.notify(`Override recorded and logged to ${OVERRIDE_FILE}.`, "info");
+    },
+  });
+
+  // ─── Tools ─────────────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "fleet_status",
+    label: "Fleet Status",
+    description:
+      "Read the current Macro Architecture Fleet state: phase, artifact presence, decision queue, and what blocks the next phase. Call this before acting so you do not guess where the job is.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      const state = loadState();
+      const text = state.job.objective ? statusReport(state) : "No job initialized.";
+      ctx.ui.notify(state.job.objective ? `[fleet] status` : `[fleet] no job`, "info");
+      return { content: [{ type: "text", text }], details: { state } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_advance_phase",
+    label: "Advance Phase",
+    description:
+      "Advance the job to the given phase (0-11). The gate is evaluated against artifacts on disk: every earlier phase must have produced its documents, verification must have run without REJECT, decisions must be resolved, and contracts must be frozen before implementation. Returns the blocking reasons if the gate refuses.",
+    parameters: Type.Object({
+      phase: Type.Optional(Type.Number({ description: "Target phase 0-11. Omit to advance by one." })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const state = loadState();
+      const target = (params as any).phase ?? state.currentPhase + 1;
+      const res = advancePhase(state, target);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return {
+        content: [{ type: "text", text: res.message }],
+        details: { ok: res.ok, currentPhase: state.currentPhase },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_record_decision",
+    label: "Record Decision",
+    description:
+      "Record an unresolved architectural decision. Use this instead of guessing when a choice has real tradeoffs — it enters the decision queue and blocks contract freeze until a human resolves it.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Short decision id, e.g. DEC-storage" }),
+      topic: Type.String({ description: "What must be decided" }),
+      reason: Type.Optional(Type.String({ description: "What forced the decision" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const p = params as any;
+      const state = loadState();
+      const res = recordDecision(state, p.id, p.topic);
+      if (res.ok && p.reason) {
+        state.decisions![p.id].trigger.reason = p.reason;
+        saveState(state);
+        writeDecisionFile(state.decisions);
+      }
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_resolve_decision",
+    label: "Resolve Decision",
+    description:
+      "Record the human's answer to a pending decision. Only call this when the user has actually chosen — do not pick an option on their behalf.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Decision id" }),
+      option: Type.String({ description: "The selected option, verbatim from the user" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const p = params as any;
+      const state = loadState();
+      const res = resolveDecision(state, p.id, p.option);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_freeze_contracts",
+    label: "Freeze Contracts",
+    description:
+      "Freeze the architecture contracts (Phase 9+). After freezing, design artifacts are immutable to the write gate; further changes must go through a decision.",
+    parameters: Type.Object({
+      contractId: Type.String({ description: "Contract identifier, e.g. core-api" }),
+      version: Type.Optional(Type.String({ description: "Contract version. Defaults to 1." })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const p = params as any;
+      const state = loadState();
+      const res = freezeContracts(state, p.contractId, p.version || "1");
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
     },
   });
 }

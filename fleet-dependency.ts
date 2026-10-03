@@ -1,286 +1,283 @@
 /**
- * fleet-dependency :: [MACRO] Phase 5 — Dependency & Adapter Isolation
+ * fleet-dependency :: Phase 5 — External Dependency Isolation
  *
- * Prevents external systems from contaminating internal architecture.
- * For every dependency (DB, cloud, framework, vendor API, hardware),
- * ensures isolation via adapter + internal contract.
+ * Inventories every external dependency (database, cloud, vendor API, library,
+ * transport, OS) and states whether it is shielded behind an internal contract.
+ * A dependency that is not shielded is a place where replaceability ends.
  *
- * Gate: Phase 4 (MODULE BOUNDARIES) must be complete.
+ * Commands: /fleet:dependencies /fleet:adapters
+ * Tools:    fleet_add_dependency, fleet_add_adapter, fleet_list_dependencies
  *
- * /fleet:dependencies  — inventory and isolate external dependencies
- * /fleet:adapters      — define adapter boundaries
+ * Usage: pi -e extensions/fleet-dependency.ts
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import {
+  DEP_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
+} from "./fleet-core.ts";
+import type { FleetState } from "./fleet-core.ts";
+import { writeFileSync } from "node:fs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface Dependency {
+export interface Dependency {
   id: string;
   name: string;
   category: "database" | "cloud" | "framework" | "library" | "hardware" | "vendor-api" | "transport" | "protocol" | "os";
   version: string;
-  usedBy: string[];       // MOD-xxx IDs
+  usedBy: string[];
   adapterRequired: boolean;
   adapterName: string;
-  internalContract: string; // FMT-xxx that shields from this dependency
+  internalContract: string;
   riskLevel: "low" | "medium" | "high";
   replaceable: boolean;
   notes: string;
 }
 
-interface Adapter {
+export interface Adapter {
   id: string;
   name: string;
-  externalDependency: string;  // DEP-xxx
-  internalInterface: string;   // FMT-xxx
+  externalDependency: string;
+  internalInterface: string;
   responsibility: string;
   status: "draft" | "approved";
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+const CATEGORIES = ["database", "cloud", "framework", "library", "hardware", "vendor-api", "transport", "protocol", "os"] as const;
 
-const ARCH_DIR = "architecture";
-const DEP_FILE = "07_DEPENDENCY_REGISTER.md";
+// ─── Operations ──────────────────────────────────────────────────────────────
 
-function cwd(): string {
-  return process.cwd();
+function deps(state: FleetState): Dependency[] {
+  if (!state.dependencies) state.dependencies = [];
+  return state.dependencies as Dependency[];
 }
 
-function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
+function adapters(state: FleetState): Adapter[] {
+  if (!state.adapters) state.adapters = [];
+  return state.adapters as Adapter[];
 }
 
-function ensureArchDir() {
-  const p = archPath();
-  if (!existsSync(p)) mkdirSync(p, { recursive: true });
+export function addDependency(state: FleetState, input: Partial<Dependency>) {
+  const list = deps(state);
+  if (!input.name?.trim()) return { ok: false, message: "name is required" };
+
+  const id = input.id?.trim() || `DEP-${String(list.length + 1).padStart(3, "0")}`;
+  if (list.some((d) => d.id === id)) return { ok: false, message: `${id} already exists` };
+
+  const dep: Dependency = {
+    id,
+    name: input.name.trim(),
+    category: (CATEGORIES.includes(input.category as any) ? input.category : "library") as Dependency["category"],
+    version: input.version?.trim() || "unspecified",
+    usedBy: input.usedBy || [],
+    adapterRequired: input.adapterRequired !== false,
+    adapterName: input.adapterName?.trim() || "",
+    internalContract: input.internalContract?.trim() || "",
+    riskLevel: (["low", "medium", "high"] as const).includes(input.riskLevel as any)
+      ? (input.riskLevel as any)
+      : "medium",
+    replaceable: input.replaceable !== false,
+    notes: input.notes?.trim() || "",
+  };
+
+  list.push(dep);
+  saveState(state);
+  writeDependencyFile(state);
+  audit(`dependency ${id} ${dep.name}`, state);
+  return { ok: true, message: `${id} recorded (${dep.category}, ${dep.riskLevel} risk)` };
 }
 
-function loadFleetState(): { state: any } | null {
-  const jsonPath = archPath("fleet-state.json");
-  if (existsSync(jsonPath)) {
-    try {
-      return JSON.parse(readFileSync(jsonPath, "utf8"));
-    } catch { return null; }
+export function addAdapter(state: FleetState, input: Partial<Adapter>) {
+  const list = adapters(state);
+  if (!input.name?.trim()) return { ok: false, message: "name is required" };
+  if (!input.internalInterface?.trim()) {
+    return { ok: false, message: "internalInterface is required — an adapter without a target interface shields nothing" };
   }
-  return null;
+
+  const id = input.id?.trim() || `ADP-${String(list.length + 1).padStart(3, "0")}`;
+  if (list.some((a) => a.id === id)) return { ok: false, message: `${id} already exists` };
+
+  const adapter: Adapter = {
+    id,
+    name: input.name.trim(),
+    externalDependency: input.externalDependency?.trim() || "",
+    internalInterface: input.internalInterface.trim(),
+    responsibility: input.responsibility?.trim() || "",
+    status: "draft",
+  };
+  list.push(adapter);
+  saveState(state);
+  writeDependencyFile(state);
+  audit(`adapter ${id} ${adapter.name}`, state);
+  return { ok: true, message: `${id} shields ${adapter.externalDependency || "?"} behind ${adapter.internalInterface}` };
 }
 
-// ─── Writers ─────────────────────────────────────────────────────────────────
+// ─── Writer ──────────────────────────────────────────────────────────────────
 
-function writeDependencyFile(deps: Dependency[], adapters: Adapter[]) {
+function writeDependencyFile(state: FleetState) {
   ensureArchDir();
-
-  const lines = ["# Dependency Register", "", `*Generated by fleet-dependency · ${new Date().toISOString()}*`, ""];
-
-  // Dependencies table
-  lines.push("## External Dependencies");
-  lines.push("");
-  lines.push("| ID | Name | Category | Version | Risk | Replaceable | Adapter |");
-  lines.push("|---|---|---|---|---|---|---|");
-  for (const d of deps) {
-    lines.push(
-      `| ${d.id} | ${d.name} | ${d.category} | ${d.version} | ${d.riskLevel} | ${d.replaceable ? "✅" : "❌"} | ${d.adapterName || "—"} |`
-    );
+  const d = deps(state);
+  const a = adapters(state);
+  if (d.length === 0 && a.length === 0) {
+    writeFileSync(archPath(DEP_FILE), "# Dependency Register\n\n*No dependencies recorded yet.*\n", "utf8");
+    return;
   }
-  lines.push("");
-
-  for (const d of deps) {
-    lines.push(`### ${d.id} — ${d.name}`);
-    lines.push(`**Category:** ${d.category}  **Version:** ${d.version}  **Risk:** ${d.riskLevel}`);
-    lines.push(`**Replaceable:** ${d.replaceable ? "✅" : "❌"}  **Adapter:** ${d.adapterName || "_direct use_"}`);
-    lines.push(`**Used by:** ${d.usedBy.join(", ") || "—"}`);
-    if (d.internalContract) lines.push(`**Internal contract:** ${d.internalContract}`);
-    if (d.notes) lines.push(`**Notes:** ${d.notes}`);
-    lines.push("---");
-    lines.push("");
+  const lines = [
+    "# Dependency Register",
+    "",
+    `*Generated by fleet-dependency · ${new Date().toISOString()}*`,
+    "",
+    "| ID | Name | Category | Version | Risk | Adapter | Contract | Used By |",
+    "|---|---|---|---|---|---|---|---|",
+  ];
+  for (const x of d) {
+    lines.push(`| ${x.id} | ${x.name} | ${x.category} | ${x.version} | ${x.riskLevel} | ${x.adapterRequired ? x.adapterName || "❌" : "n/a"} | ${x.internalContract || "—"} | ${x.usedBy.join(", ") || "—"} |`);
   }
-
-  if (adapters.length > 0) {
-    lines.push("## Adapter Boundaries");
+  lines.push("", "---", "");
+  for (const x of d) {
+    lines.push(`## ${x.id} — ${x.name}`);
     lines.push("");
-    lines.push("| ID | Adapter | External Dependency | Internal Interface | Status |");
-    lines.push("|---|---|---|---|---|");
-    for (const a of adapters) {
-      lines.push(`| ${a.id} | ${a.name} | ${a.externalDependency} | ${a.internalInterface} | ${a.status} |`);
+    lines.push(`**Category:** ${x.category}  **Version:** ${x.version}  **Risk:** ${x.riskLevel}`);
+    lines.push(`**Adapter Required:** ${x.adapterRequired ? "yes" : "no"}  **Adapter:** ${x.adapterName || "—"}`);
+    lines.push("");
+    lines.push(`**Internal Contract:** ${x.internalContract || "—"}`);
+    lines.push("");
+    lines.push("### Used By");
+    if (x.usedBy.length) for (const m of x.usedBy) lines.push(`- ${m}`);
+    else lines.push("_none_");
+    lines.push("");
+    lines.push(`**Replaceable:** ${x.replaceable ? "✅" : "❌"}`);
+    lines.push("");
+    if (x.notes) { lines.push(x.notes); lines.push(""); }
+    lines.push("---", "");
+  }
+  if (a.length > 0) {
+    lines.push("## Adapters", "");
+    lines.push("| ID | Name | Shields | Internal Interface | Responsibility | Status |", "|---|---|---|---|---|---|");
+    for (const x of a) {
+      lines.push(`| ${x.id} | ${x.name} | ${x.externalDependency || "—"} | ${x.internalInterface} | ${x.responsibility || "—"} | ${x.status} |`);
     }
     lines.push("");
-    for (const a of adapters) {
-      lines.push(`### ${a.id} — ${a.name}`);
-      lines.push(`**External:** ${a.externalDependency} → **Internal:** ${a.internalInterface}`);
-      lines.push(a.responsibility || "");
-      lines.push(`**Status:** ${a.status}`);
-      lines.push("---");
+    for (const x of a) {
+      lines.push(`## ${x.id} — ${x.name}`);
       lines.push("");
+      lines.push(`**External Dependency:** ${x.externalDependency || "—"}`);
+      lines.push(`**Internal Interface:** ${x.internalInterface}`);
+      lines.push("");
+      lines.push("### Boundary");
+      lines.push(x.responsibility || "_unspecified_");
+      lines.push("");
+      lines.push("---", "");
     }
   }
-
-  if (deps.length === 0) lines.push("*No dependencies inventoried yet.*");
   writeFileSync(archPath(DEP_FILE), lines.join("\n"), "utf8");
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  let deps: Dependency[] = [];
-  let adapters: Adapter[] = [];
-
-  pi.on("session_start", async () => {
-    const statePath = archPath("dep-state.json");
-    if (existsSync(statePath)) {
-      try {
-        const saved = JSON.parse(readFileSync(statePath, "utf8"));
-        deps = saved.deps || [];
-        adapters = saved.adapters || [];
-      } catch { /* ignore */ }
-    }
+  pi.on("before_agent_start", async (_event: any, ctx: any) => {
+    const brief = phaseBrief(loadState());
+    if (!brief) return null;
+    return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${brief}` };
   });
-
-  function checkGate(ctx: any): boolean {
-    const fleet = loadFleetState();
-    if (!fleet || !fleet.state?.job?.objective) {
-      ctx.ui.notify("No job initialized. Run /fleet:new-job first.", "warning");
-      return false;
-    }
-    if (!fleet.state.phaseGates?.[4]) {
-      ctx.ui.notify("Phase 4 (MODULE BOUNDARIES) not complete. Run /fleet:modules and advance with /fleet:phase 5.", "warning");
-      return false;
-    }
-    return true;
-  }
-
-  function saveState() {
-    ensureArchDir();
-    writeFileSync(archPath("dep-state.json"), JSON.stringify({ deps, adapters }, null, 2), "utf8");
-    writeDependencyFile(deps, adapters);
-  }
-
-  // ─── Command: fleet:dependencies ───────────────────────────────────────
 
   pi.registerCommand("fleet:dependencies", {
     description: "Inventory and isolate external dependencies (Phase 5)",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      ctx.ui.notify(
-        "Dependency inventory. List every external dependency (DB, cloud, framework, library, hardware, vendor API, transport, protocol, OS). Each must be isolated behind an adapter.",
-        "info"
-      );
-
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input(
-          `Dependency #${deps.length + 1} name (e.g., 'PostgreSQL 16', 'AWS S3', 'Docker') — or blank to stop`,
-          ""
-        );
-        if (!name) { addMore = false; break; }
-
-        const catRaw = await ctx.ui.select("Category", [
-          { label: "Database", value: "database" },
-          { label: "Cloud", value: "cloud" },
-          { label: "Framework", value: "framework" },
-          { label: "Library", value: "library" },
-          { label: "Hardware", value: "hardware" },
-          { label: "Vendor API", value: "vendor-api" },
-          { label: "Transport", value: "transport" },
-          { label: "Protocol", value: "protocol" },
-          { label: "Operating System", value: "os" },
-        ]);
-        const version = await ctx.ui.input("Version", "latest");
-
-        const riskRaw = await ctx.ui.select("Risk level", [
-          { label: "Low", value: "low" },
-          { label: "Medium", value: "medium" },
-          { label: "High", value: "high" },
-        ]);
-
-        const usedByRaw = await ctx.ui.input("Used by which modules? (MOD-xxx, comma-separated)", "");
-        const usedBy = usedByRaw.split(",").map((s: string) => s.trim()).filter(Boolean);
-
-        const adapterNeeded = await ctx.ui.confirm("Adapter required?", "Should this be isolated behind an internal contract?");
-        const adapterName = adapterNeeded ? await ctx.ui.input("Adapter name", `${name.replace(/\s+/g, "-").toLowerCase()}-adapter`) : "";
-        const internalContract = adapterNeeded ? await ctx.ui.input("Internal interface (FMT-xxx)", "") : "";
-        const replaceable = await ctx.ui.confirm("Replaceable?", "Can this be swapped for an alternative?");
-        const notes = await ctx.ui.input("Notes", "");
-
-        const id = `DEP-${String(deps.length + 1).padStart(3, "0")}`;
-        deps.push({
-          id,
-          name,
-          category: (catRaw || "library") as any,
-          version: version || "latest",
-          usedBy,
-          adapterRequired: adapterNeeded,
-          adapterName: adapterName || "",
-          internalContract: internalContract || "",
-          riskLevel: (riskRaw || "medium") as any,
-          replaceable,
-          notes: notes || "",
-        });
-        saveState();
-        ctx.ui.notify(`🔌 ${id} — "${name}" inventoried (risk: ${riskRaw || "medium"})`, "info");
-
-        const more = await ctx.ui.confirm("Add another dependency?", "");
-        if (!more) addMore = false;
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Dependency name (blank to finish)", "");
+        if (!name) break;
+        const category = await ctx.ui.input(`Category (${CATEGORIES.join("/")})`, "library");
+        const version = await ctx.ui.input("Version", "");
+        const usedBy = await ctx.ui.input("Used by (MOD ids, comma-separated)", "");
+        const isolate = (await ctx.ui.input("Needs an adapter boundary? (y/n)", "y")) === "y";
+        const res = addDependency(state, {
+          name, category: category as any, version, isolate,
+          adapterRequired: isolate,
+          usedBy: usedBy ? usedBy.split(",").map((s) => s.trim()).filter(Boolean) : [],
+        } as any);
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
-
-      saveState();
-      ctx.ui.notify(
-        `✅ ${deps.length} dependencies inventoried. ${deps.filter((d) => d.adapterRequired).length} need adapters.`,
-        "info"
-      );
     },
   });
-
-  // ─── Command: fleet:adapters ───────────────────────────────────────────
 
   pi.registerCommand("fleet:adapters", {
     description: "Define adapter boundaries for dependencies",
     handler: async (_args, ctx) => {
-      if (!checkGate(ctx)) return;
-
-      const unadapted = deps.filter((d) => d.adapterRequired && !adapters.find((a) => a.externalDependency === d.id));
-      if (unadapted.length === 0) {
-        ctx.ui.notify("All dependencies that need adapters already have one defined.", "info");
-      } else {
-        ctx.ui.notify(`Dependencies needing adapters: ${unadapted.map((d) => d.id).join(", ")}`, "info");
+      const state = loadState();
+      for (;;) {
+        const name = await ctx.ui.input("Adapter name (blank to finish)", "");
+        if (!name) break;
+        const dep = await ctx.ui.input("Shields which DEP id?", "");
+        const iface = await ctx.ui.input("Internal interface (FMT id)", "");
+        const resp = await ctx.ui.input("Boundary responsibility", "");
+        const res = addAdapter(state, { name, externalDependency: dep, internalInterface: iface, responsibility: resp });
+        ctx.ui.notify(res.message, res.ok ? "info" : "error");
       }
+    },
+  });
 
-      let addMore = true;
-      while (addMore) {
-        const name = await ctx.ui.input("Adapter name (e.g., 'PostgreSQL Adapter') — or blank to stop", "");
-        if (!name) { addMore = false; break; }
+  pi.registerTool({
+    name: "fleet_add_dependency",
+    label: "Add Dependency",
+    description:
+      "Record an external dependency. If adapterRequired is true, Phase 7 verification will REJECT until a matching adapter exists — the adapter is what keeps the dependency replaceable.",
+    parameters: Type.Object({
+      name: Type.String(),
+      category: Type.Optional(Type.Union(CATEGORIES.map((c) => Type.Literal(c) as any))),
+      version: Type.Optional(Type.String()),
+      usedBy: Type.Optional(Type.Array(Type.String(), { description: "MOD- ids" })),
+      adapterRequired: Type.Optional(Type.Boolean({ description: "Default true" })),
+      adapterName: Type.Optional(Type.String()),
+      internalContract: Type.Optional(Type.String({ description: "FMT- id that shields it" })),
+      riskLevel: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])),
+      replaceable: Type.Optional(Type.Boolean({ description: "Default true" })),
+      notes: Type.Optional(Type.String()),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addDependency(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
 
-        const depId = await ctx.ui.input("External dependency ID (DEP-xxx)", "");
-        const dep = deps.find((d) => d.id === depId);
-        if (!dep) {
-          ctx.ui.notify(`Dependency ${depId} not found.`, "error");
-          continue;
-        }
+  pi.registerTool({
+    name: "fleet_add_adapter",
+    label: "Add Adapter",
+    description:
+      "Define the boundary that shields an external dependency. internalInterface must name an existing FMT- contract.",
+    parameters: Type.Object({
+      name: Type.String(),
+      internalInterface: Type.String({ description: "FMT- id this adapter satisfies" }),
+      externalDependency: Type.Optional(Type.String({ description: "DEP- id" })),
+      responsibility: Type.Optional(Type.String({ description: "What crosses the boundary" })),
+      id: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const res = addAdapter(loadState(), params as any);
+      ctx.ui.notify(res.message, res.ok ? "info" : "error");
+      return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
+    },
+  });
 
-        const intId = await ctx.ui.input("Internal interface contract (FMT-xxx)", dep.internalContract || "");
-        const responsibility = await ctx.ui.input("Adapter responsibility", `Isolates ${dep.name} behind internal contract`);
-
-        const id = `ADP-${String(adapters.length + 1).padStart(3, "0")}`;
-        adapters.push({
-          id,
-          name,
-          externalDependency: depId,
-          internalInterface: intId || dep.internalContract,
-          responsibility: responsibility || `Isolates ${dep.name}`,
-          status: "draft",
-        });
-        saveState();
-        ctx.ui.notify(`🔧 ${id} — "${name}" created`, "info");
-
-        const more = await ctx.ui.confirm("Add another adapter?", "");
-        if (!more) addMore = false;
-      }
-
-      saveState();
-      ctx.ui.notify(`✅ ${adapters.length} adapters defined`, "info");
+  pi.registerTool({
+    name: "fleet_list_dependencies",
+    label: "List Dependencies",
+    description: "List every external dependency and whether it is shielded by an adapter.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      const state = loadState();
+      const list = deps(state);
+      const text = list.length === 0
+        ? "No dependencies recorded."
+        : list
+            .map((x) => `${x.id} — ${x.name} (${x.category} ${x.riskLevel}) adapter: ${x.adapterRequired ? x.adapterName || "MISSING" : "n/a"}`)
+            .join("\n");
+      return { content: [{ type: "text", text }], details: { count: list.length, adapters: adapters(state).length } };
     },
   });
 }

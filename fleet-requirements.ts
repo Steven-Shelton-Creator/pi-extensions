@@ -16,8 +16,7 @@ import { Type } from "@sinclair/typebox";
 import {
   PHASES, REQ_FILE, RISK_FILE,
   archPath, ensureArchDir, loadState, saveState, audit,
-  gateForPhase, phaseBrief,
-} from "./fleet-core.ts";
+  gateForPhase, phaseBrief, aborted, ABORTED_RESULT } from "./fleet-core.ts";
 import type { FleetState } from "./fleet-core.ts";
 import { writeFileSync } from "node:fs";
 
@@ -282,7 +281,8 @@ export default function (pi: ExtensionAPI) {
       ),
       source: Type.Optional(Type.String({ description: "Where the requirement came from" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = addRequirement(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
@@ -302,7 +302,8 @@ export default function (pi: ExtensionAPI) {
       impact: Type.Optional(Type.Union([Type.Literal("high"), Type.Literal("medium"), Type.Literal("low")])),
       mitigation: Type.Optional(Type.String({ description: "How the risk is contained" })),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = addRisk(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };

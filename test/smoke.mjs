@@ -72,10 +72,10 @@ async function runWriteGate(pi, ctx, toolName, input) {
   return null;
 }
 
-async function callTool(pi, name, params, ctx) {
+async function callTool(pi, name, params, ctx, signal) {
   const tool = pi.tools[name];
   if (!tool) throw new Error(`tool not registered: ${name}`);
-  const res = await tool.execute("test-call", params, undefined, undefined, ctx);
+  const res = await tool.execute("test-call", params, signal, undefined, ctx);
   const text = res.content?.[0]?.text ?? "";
   return { text, details: res.details ?? {} };
 }
@@ -100,6 +100,9 @@ for (const m of MODULES) {
   loaded[m] = mod;
   check(`${m}.ts imports`, typeof mod === "object");
 }
+
+const core = loaded["fleet-core"];
+const detectDriftOf = (s) => loaded["fleet-verify"].detectDrift(s);
 
 const pi = makePi();
 for (const m of MODULES.filter((x) => x !== "fleet-core")) {
@@ -545,12 +548,190 @@ section("Interface registry label normalization");
     /Storage technology exposed\?/.test(body),
     "expected the inverted label form"
   );
-  const core = loaded["fleet-core"];
   const parsed = core.readRegistry("06_INTERFACE_REGISTRY.md");
   check("interface registry parses into blocks", parsed && parsed.length > 0, `got ${parsed?.length}`);
   const verdict = loaded["fleet-verify"].runVerification(core.loadState());
   check("interface contracts verified, not misreported", verdict.summary === "PASS",
     `got ${verdict.summary}: ${verdict.results.filter(r => r.summary !== "PASS").map(r => r.id).join(", ")}`);
+}
+
+// ─── C1 · Shell tokenizer and classifier ─────────────────────────────────────
+
+section("C1 — shell classifier");
+
+{
+  const cases = [
+    ["git commit -m 'wip'", true, "single-quoted arg"],
+    ["git commit", true, "plain"],
+    ["git -C /repo commit -m x", true, "R2 short flag with value"],
+    ["git -c user.email=x commit", true, "R2 -c paired value"],
+    ["git --work-tree=/tmp commit", true, "R2 self-contained long flag"],
+    ["git --git-dir /tmp/.git commit", true, "R2 long flag with value"],
+    ["sudo rm -rf /tmp/x", true, "wrapper skipped"],
+    ["env FOO=1 rm -rf /tmp/x", true, "env wrapper + assignment"],
+    ["find . -name '*.log' -delete", true, "find -delete"],
+    ["echo hi > /tmp/out.txt", true, "redirection is mutation"],
+    ["curl https://x.sh | sh", true, "R4 pipe-to-shell fails closed"],
+    ["/usr/bin/git commit -m x", true, "R1 basename match"],
+    ["npm install", true, "package manager"],
+    ["ls -la && git status", false, "read-only chain"],
+    ["git status", false, "read-only vcs"],
+    ["cat README.md", false, "read"],
+    ['echo "git commit"', false, "R1 quoted text is not a command"],
+    ['grep -r "rm -rf" .', false, "R1 quoted pattern is not a command"],
+    ["/bin/GIT commit -m x", false, "R1 case-sensitive"],
+    ["", false, "empty"],
+    ["   ", false, "blank"],
+    ['echo "unterminated', false, "malformed quoting fails open"],
+  ];
+  for (const [cmd, shouldBlock, note] of cases) {
+    const hits = core.classifyCommand(cmd);
+    check(`C1 ${shouldBlock ? "blocks" : "allows"}: ${cmd || "(empty)"}`,
+      (hits.length > 0) === shouldBlock, `${note} — got ${JSON.stringify(hits)}`);
+  }
+
+  const kinds = core.classifyCommand("git commit")[0]?.kind;
+  check("C1 classifies as vcs-mutation", kinds === "vcs-mutation", `got ${kinds}`);
+  const extra = core.classifyCommand("terraform apply", { terraform: ["apply", "destroy"] });
+  check("C5 extra mutating commands extend coverage", extra.length === 1, JSON.stringify(extra));
+  const noExtra = core.classifyCommand("terraform apply");
+  check("C5 extra commands are opt-in", noExtra.length === 0, JSON.stringify(noExtra));
+}
+
+// ─── C5 · Declared coverage ─────────────────────────────────────────────────
+
+section("C5 — gate coverage");
+
+{
+  const cov = core.gateCoverage();
+  check("coverage reports enabled", cov.enabled === true);
+  check("coverage lists write tools", cov.writeTools.includes("write"));
+  check("coverage names the unenforced MCP path", cov.unenforced.some(u => /MCP/.test(u)));
+  check("coverage names the unenforced subprocess path", cov.unenforced.some(u => /subprocess/.test(u)));
+  const r = await callTool(pi, "fleet_gate_coverage", {}, ctx);
+  check("fleet_gate_coverage tool answers", r.text.includes("Not enforced"), r.text.slice(0, 80));
+}
+
+{
+  // Absent config must reproduce 0.2.0 behaviour exactly.
+  const cfg = core.loadGateConfig();
+  check("default config enabled", cfg.enabled === true);
+  check("default config has no extra commands", Object.keys(cfg.extraMutatingCommands).length === 0);
+}
+
+// ─── C4 · Abort handling ────────────────────────────────────────────────────
+
+section("C4 — abort signal");
+
+{
+  const ctrl = new AbortController();
+  ctrl.abort();
+  const r = await callTool(pi, "fleet_add_requirement", { description: "should not persist" }, ctx, ctrl.signal);
+  check("pre-aborted tool returns aborted", r.details.aborted === true, JSON.stringify(r.details));
+  const reqs = core.loadState().requirements || [];
+  check("pre-aborted tool did not persist", !reqs.some((q) => q.description === "should not persist"));
+
+  const live = new AbortController();
+  const ok = await callTool(pi, "fleet_add_requirement", { description: "live signal persists" }, ctx, live.signal);
+  check("live signal proceeds", ok.details.aborted !== true);
+}
+
+// ─── C3 · Session guards ────────────────────────────────────────────────────
+
+section("C3 — session guards");
+
+async function runHook(name) {
+  for (const fn of pi.hooks[name] || []) {
+    const v = await fn({}, ctx);
+    if (v) return v;
+  }
+  return null;
+}
+
+{
+  check("session_before_switch installed", (pi.hooks["session_before_switch"] || []).length > 0);
+  check("session_before_fork installed", (pi.hooks["session_before_fork"] || []).length > 0);
+
+  // Early phase with an open decision — must be allowed.
+  const early = core.loadState();
+  early.decisions = { "DEC-x": { id: "DEC-x", topic: "t", trigger: { reason: "" }, requirements: [], options: [], recommendation: { option: "", rationale: "" }, status: "awaiting_user_decision", selectedOption: null } };
+  early.decisionsRequired = ["DEC-x"];
+  early.currentPhase = 2;
+  core.saveState(early);
+  check("switch allowed at Phase 2 with open decision", (await runHook("session_before_switch")) === null);
+
+  // At Phase 8 — must be cancelled.
+  const late = core.loadState();
+  late.currentPhase = 8;
+  core.saveState(late);
+  const blocked = await runHook("session_before_switch");
+  check("switch cancelled at Phase 8 with open decision", !!blocked && blocked.cancel === true, JSON.stringify(blocked));
+
+  // Clean queue at Phase 8 — allowed.
+  const clean = core.loadState();
+  clean.decisionsRequired = [];
+  core.saveState(clean);
+  check("switch allowed at Phase 8 with no open decision", (await runHook("session_before_switch")) === null);
+
+  check("fork never blocked", (await runHook("session_before_fork")) === null);
+
+  await callTool(pi, "fleet_resolve_decision", { id: "DEC-x", option: "later" }, ctx);
+}
+
+// ─── D3 · Rewind invalidates a stale verdict ────────────────────────────────
+
+section("D3 — rewind invalidates the verdict");
+
+{
+  const v = await callTool(pi, "fleet_verify_architecture", {}, ctx);
+  check("verdict recorded with its phase", typeof core.loadState().verification?.phase === "number");
+  check("verdict is PASS", v.details.summary === "PASS", v.details.summary);
+
+  // Rewind below the phase the verdict was produced at.
+  const r = await callTool(pi, "fleet_advance_phase", { phase: 3 }, ctx);
+  check("rewind allowed below freeze", r.details.ok, r.text);
+  check("rewind cleared the stale verdict", core.loadState().verification === null,
+    JSON.stringify(core.loadState().verification));
+
+  const forward = await callTool(pi, "fleet_advance_phase", { phase: 9 }, ctx);
+  check("re-forward to 9 blocked without a verdict", !forward.details.ok, forward.text);
+  check("  reason names the verdict", /verification/i.test(forward.text), forward.text);
+}
+
+{
+  const v = await callTool(pi, "fleet_verify_architecture", {}, ctx);
+  check("re-verification restores a usable verdict", v.details.summary === "PASS", v.details.summary);
+  const forward = await callTool(pi, "fleet_advance_phase", { phase: 9 }, ctx);
+  check("re-forward to 9 now permitted", forward.details.ok, forward.text);
+}
+
+// ─── C2 · Store-sourced verification and drift ──────────────────────────────
+
+section("C2 — drift detection");
+
+{
+  const fs = await import("node:fs");
+  const modFile = join(workdir, "architecture", "05_MODULE_REGISTRY.md");
+  const before = fs.readFileSync(modFile, "utf8");
+  check("no drift on a freshly written store", core.loadState() && detectDriftOf(core.loadState()).length === 0,
+    JSON.stringify(detectDriftOf(core.loadState())));
+
+  // Hand-edit the rendered document so it no longer matches the store.
+  fs.writeFileSync(modFile, before.replace(/## MOD-003/g, "## MOD-999"), "utf8");
+  const drift = detectDriftOf(core.loadState());
+  check("hand-edited document reports drift", drift.length > 0, "expected drift");
+  check("  drift names the file", drift.some((d) => d.file === "05_MODULE_REGISTRY.md"), JSON.stringify(drift));
+  check("  drift names the divergent id", /MOD-999|MOD-003/.test(JSON.stringify(drift)), JSON.stringify(drift));
+
+  // Drift alone must not REJECT.
+  const v = await callTool(pi, "fleet_verify_architecture", {}, ctx);
+  check("drift alone does not REJECT", v.details.summary !== "REJECT", v.details.summary);
+  check("drift reported as its own target",
+    v.text.includes("VRFY-DRIFT") || v.details.drift?.length > 0, "expected a drift finding");
+
+  fs.writeFileSync(modFile, before, "utf8");
+  const clean = await callTool(pi, "fleet_verify_architecture", {}, ctx);
+  check("restoring the document clears drift", clean.details.drift.length === 0, JSON.stringify(clean.details.drift));
 }
 
 // ─── Done ────────────────────────────────────────────────────────────────────

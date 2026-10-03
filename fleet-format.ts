@@ -19,8 +19,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
-  FMT_FILE, INT_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
-} from "./fleet-core.ts";
+  FMT_FILE, INT_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief, aborted, ABORTED_RESULT } from "./fleet-core.ts";
 import type { FleetState } from "./fleet-core.ts";
 import { writeFileSync } from "node:fs";
 
@@ -275,7 +274,8 @@ export default function (pi: ExtensionAPI) {
         Type.Boolean({ description: "Set true to revise an existing contract id" })
       ),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = defineContract(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
@@ -287,7 +287,8 @@ export default function (pi: ExtensionAPI) {
     label: "List Contracts",
     description: "List every registered contract with its type, status, and version.",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const list = contracts(loadState());
       const text = list.length === 0
         ? "No contracts registered."

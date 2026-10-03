@@ -14,7 +14,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 
 // ─── Phases ──────────────────────────────────────────────────────────────────
@@ -259,6 +259,21 @@ export function audit(line: string, state?: FleetState): void {
   appendFileSync(archPath(AUDIT_FILE), `${new Date().toISOString()} ${phase} ${line}\n`, "utf8");
 }
 
+// ─── Abort (C4) ─────────────────────────────────────────────────────────────
+//
+// Nothing in the fleet is long-running, so this does not make anything
+// interruptible. It removes one correctness hazard: a turn aborted between an
+// operation's computation and its saveState could still persist.
+
+export function aborted(signal?: AbortSignal): boolean {
+  return !!signal?.aborted;
+}
+
+export const ABORTED_RESULT = {
+  content: [{ type: "text" as const, text: "Aborted before persisting." }],
+  details: { aborted: true },
+};
+
 // ─── Gates ───────────────────────────────────────────────────────────────────
 
 /** A file counts as produced if it exists and is not an empty placeholder. */
@@ -333,16 +348,356 @@ export function blockersBefore(state: FleetState, n: number): string[] {
 
 // ─── Write gate ──────────────────────────────────────────────────────────────
 
-const WRITE_TOOLS = new Set(["write", "edit", "multi_edit", "multiedit", "patch", "apply_patch"]);
-const MUTATING_BASH = [
-  /\bgit\s+commit\b/,
-  /\brm\s+-[a-z]*r/,
-  /\bnpm\s+(install|i|publish)\b/,
-  /\bcargo\s+(add|publish)\b/,
-  /\bgo\s+get\b/,
-  /\bpip\s+install\b/,
-  /\bcurl\b.*\|\s*(ba)?sh/,
-];
+const DEFAULT_WRITE_TOOLS = ["write", "edit", "multi_edit", "multiedit", "patch", "apply_patch"];
+const DEFAULT_SHELL_TOOLS = ["bash", "shell"];
+
+// ─── Shell tokenizer (C1) ────────────────────────────────────────────────────
+//
+// Replaces the 0.2.0 regex list, which matched anywhere in the line: it fired on
+// `echo "git commit"`, missed `git -c k=v commit`, and blocked `/usr/bin/git`
+// while allowing the hypothetical `./GIT` would not be. Classification is now by
+// command name plus argument inspection, case-sensitively, against a basename.
+
+export interface ShellSegment {
+  argv: string[];
+  raw: string;
+  redirects: boolean;
+  /** True when this segment is the target of a pipe. */
+  piped: boolean;
+}
+
+const SEPARATORS = ["&&", "||", ";", "|", "\n"];
+
+/** Split a command line into segments, honouring single and double quotes. */
+export function tokenizeShell(command: string): ShellSegment[] {
+  if (!command || typeof command !== "string") return [];
+
+  const segments: ShellSegment[] = [];
+  let argv: string[] = [];
+  let current = "";
+  let raw = "";
+  let redirects = false;
+  let quote: '"' | "'" | null = null;
+
+  const endToken = () => {
+    if (current !== "") { argv.push(current); current = ""; }
+  };
+
+  const flush = (piped: boolean) => {
+    endToken();
+    if (argv.length > 0 || raw.trim()) {
+      segments.push({ argv, raw: raw.trim(), redirects, piped });
+    }
+    argv = [];
+    raw = "";
+    redirects = false;
+  };
+
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i];
+
+    if (quote) {
+      if (ch === quote) { quote = null; i++; continue; }
+      if (quote === '"' && ch === "\\" && i + 1 < command.length) {
+        current += command[i + 1];
+        raw += ch + command[i + 1];
+        i += 2;
+        continue;
+      }
+      current += ch;
+      raw += ch;
+      i++;
+      continue;
+    }
+
+    // Redirection is mutation even when it targets a harmless command.
+    if (ch === ">") {
+      endToken();
+      redirects = true;
+      raw += ch;
+      i++;
+      continue;
+    }
+
+    const two = command.slice(i, i + 2);
+    if (SEPARATORS.includes(two)) {
+      flush(two === "|");
+      i += 2;
+      continue;
+    }
+    if (ch === "|" || ch === ";" || ch === "\n") {
+      flush(ch === "|");
+      i++;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      endToken();
+      raw += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      raw += ch;
+      i++;
+      continue;
+    }
+
+    current += ch;
+    raw += ch;
+    i++;
+  }
+
+  flush(false);
+  return segments;
+}
+
+const WRAPPERS = new Set(["sudo", "env", "command", "nohup", "time", "nice", "doas", "xargs"]);
+
+/** Strip env assignments and wrappers; return the basename of the real command. */
+function bareCommand(argv: string[]): string | null {
+  let i = 0;
+  // Assignments and wrappers may interleave: `env FOO=1 sudo rm -rf /x`.
+  for (;;) {
+    if (i >= argv.length) return null;
+    const t = argv[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }
+    if (WRAPPERS.has(t)) { i++; continue; }
+    break;
+  }
+  const token = argv[i];
+  if (!token) return null;
+  const parts = token.split(/[\\/]/);
+  return parts[parts.length - 1];
+}
+
+/** git short options that consume the following token as their value. */
+const VCS_SHORT_WITH_VALUE = new Set(["C", "c", "f", "p"]);
+/** git long options that consume the following token as their value. */
+const VCS_LONG_WITH_VALUE = new Set([
+  "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env",
+]);
+
+/**
+ * Subcommand for revision-control tools, which accept options before it.
+ *
+ * `git -c user.email=x commit`, `git -C /repo commit` and
+ * `git --work-tree=/tmp commit` all put a flag ahead of the verb. Missing these
+ * resolves the subcommand to a flag and the mutation is never seen.
+ */
+function vcsSubcommand(argv: string[]): string | null {
+  let i = 1;
+  while (i < argv.length) {
+    const t = argv[i];
+    if (!t.startsWith("-")) return t;
+    if (t.includes("=")) { i += 1; continue; }               // --work-tree=/tmp
+    if (t.startsWith("--")) {                                // --git-dir /path
+      i += VCS_LONG_WITH_VALUE.has(t) ? 2 : 1;
+      continue;
+    }
+    if (t.length === 2) {                                    // -C /repo  |  -c k=v
+      i += VCS_SHORT_WITH_VALUE.has(t.slice(1)) ? 2 : 1;
+      continue;
+    }
+    i += 1;                                                  // -ab combined flags
+  }
+  return null;
+}
+
+const VCS_MUTATIONS: Record<string, string[]> = {
+  git: ["commit", "merge", "rebase", "push", "reset", "revert", "cherry-pick", "clean", "filter-branch"],
+  hg: ["commit", "push", "rebase"],
+  svn: ["commit", "delete"],
+};
+
+const PACKAGE_MANAGERS: Record<string, string[]> = {
+  npm: ["install", "i", "ci", "publish", "add"],
+  cargo: ["add", "publish", "install"],
+  go: ["get", "install"],
+  pip: ["install", "uninstall"],
+  pip3: ["install", "uninstall"],
+  gem: ["install"],
+  apt: ["install", "remove", "purge"],
+  "apt-get": ["install", "remove", "purge"],
+  brew: ["install", "uninstall"],
+};
+
+const SHELL_INTERPRETERS = new Set(["sh", "bash", "zsh", "ksh", "dash", "fish"]);
+
+/**
+ * Classify a segment as a mutation.
+ *
+ * Returns null when the segment does not mutate. `extra` lets `.pi/fleet-gate.json`
+ * add commands without editing source.
+ */
+export function classifySegment(
+  seg: ShellSegment,
+  extra: Record<string, string[]> = {}
+): { kind: string; why: string } | null {
+  const name = bareCommand(seg.argv);
+  if (!name) return null;
+
+  // R4: pipe-to-shell fails closed regardless of parse confidence.
+  if (seg.piped && SHELL_INTERPRETERS.has(name) && seg.argv.length === 1) {
+    return { kind: "remote-exec", why: `pipe into ${name}` };
+  }
+
+  if (VCS_MUTATIONS[name]) {
+    const sub = vcsSubcommand(seg.argv);
+    if (sub && VCS_MUTATIONS[name].includes(sub)) {
+      return { kind: "vcs-mutation", why: `${name} ${sub}` };
+    }
+  }
+
+  if (PACKAGE_MANAGERS[name]) {
+    const sub = seg.argv.slice(1).find((t) => !t.startsWith("-"));
+    if (sub && PACKAGE_MANAGERS[name].includes(sub)) {
+      return { kind: "package-install", why: `${name} ${sub}` };
+    }
+  }
+
+  const extraSubs = extra[name];
+  if (extraSubs && seg.argv.slice(1).some((t) => extraSubs.includes(t))) {
+    return { kind: "external-mutation", why: `${name} ${seg.argv.slice(1).find((t) => extraSubs.includes(t))}` };
+  }
+
+  if (name === "rm") {
+    const recursive = seg.argv.slice(1).some((t) => /^-[a-zA-Z]*r/.test(t));
+    if (recursive) return { kind: "destructive-fs", why: "rm -r" };
+  }
+  if (name === "find" && seg.argv.includes("-delete")) {
+    return { kind: "destructive-fs", why: "find -delete" };
+  }
+  if (["dd", "mkfs", "shred", "fdisk", "parted"].includes(name)) {
+    return { kind: "destructive-fs", why: name };
+  }
+  if (name === "tee") {
+    return { kind: "redirect-write", why: "tee" };
+  }
+  if (name === "curl" || name === "wget") {
+    const pipedNext = seg.piped;
+    if (pipedNext) return { kind: "remote-exec", why: `${name} piped onward` };
+  }
+
+  if (seg.redirects) {
+    return { kind: "redirect-write", why: "output redirection" };
+  }
+
+  return null;
+}
+
+/** Every mutating segment in a command line, with the ones that failed to parse. */
+export function classifyCommand(
+  command: string,
+  extra: Record<string, string[]> = {}
+): { kind: string; why: string }[] {
+  const hits: { kind: string; why: string }[] = [];
+  let segments: ShellSegment[] = [];
+  try {
+    segments = tokenizeShell(command);
+  } catch {
+    return hits; // fail open on tokenizer error
+  }
+  for (const seg of segments) {
+    const hit = classifySegment(seg, extra);
+    if (hit) hits.push(hit);
+  }
+  return hits;
+}
+
+// ─── Gate config (C5) ───────────────────────────────────────────────────────
+//
+// Coverage is declared, not buried. Defaults reproduce 0.2.0 behaviour exactly,
+// so an absent file changes nothing. Deliberately outside architecture/, which
+// is gitignored workspace output — this is config a user must be able to commit.
+
+export const GATE_CONFIG_PATH = ".pi/fleet-gate.json";
+
+export interface GateConfig {
+  enabled: boolean;
+  writeTools: string[];
+  shellTools: string[];
+  extraMutatingCommands: Record<string, string[]>;
+  sessionGuards: boolean;
+}
+
+export const DEFAULT_GATE_CONFIG: GateConfig = {
+  enabled: true,
+  writeTools: DEFAULT_WRITE_TOOLS,
+  shellTools: DEFAULT_SHELL_TOOLS,
+  extraMutatingCommands: {},
+  sessionGuards: true,
+};
+
+let cachedConfig: { mtime: number; config: GateConfig } | null = null;
+
+export function loadGateConfig(): GateConfig {
+  const p = join(cwd(), GATE_CONFIG_PATH);
+  try {
+    const mtime = existsSync(p) ? statSync(p).mtimeMs : 0;
+    if (cachedConfig && cachedConfig.mtime === mtime) return cachedConfig.config;
+
+    if (!existsSync(p)) {
+      cachedConfig = { mtime, config: { ...DEFAULT_GATE_CONFIG } };
+      return cachedConfig.config;
+    }
+    const raw = JSON.parse(readFileSync(p, "utf8"));
+    cachedConfig = {
+      mtime,
+      config: {
+        enabled: raw.enabled !== false,
+        writeTools: Array.isArray(raw.writeTools) && raw.writeTools.length
+          ? raw.writeTools : DEFAULT_WRITE_TOOLS,
+        shellTools: Array.isArray(raw.shellTools) && raw.shellTools.length
+          ? raw.shellTools : DEFAULT_SHELL_TOOLS,
+        extraMutatingCommands: raw.extraMutatingCommands && typeof raw.extraMutatingCommands === "object"
+          ? raw.extraMutatingCommands : {},
+        sessionGuards: raw.sessionGuards !== false,
+      },
+    };
+    return cachedConfig.config;
+  } catch {
+    return { ...DEFAULT_GATE_CONFIG };
+  }
+}
+
+export interface GateCoverage {
+  enabled: boolean;
+  configPath: string;
+  writeTools: string[];
+  shellTools: string[];
+  extraMutatingCommands: Record<string, string[]>;
+  sessionGuards: boolean;
+  enforced: string[];
+  unenforced: string[];
+}
+
+/** What the gate reaches, and — more usefully — what it does not. */
+export function gateCoverage(): GateCoverage {
+  const cfg = loadGateConfig();
+  return {
+    enabled: cfg.enabled,
+    configPath: GATE_CONFIG_PATH,
+    writeTools: cfg.writeTools,
+    shellTools: cfg.shellTools,
+    extraMutatingCommands: cfg.extraMutatingCommands,
+    sessionGuards: cfg.sessionGuards,
+    enforced: [
+      ...cfg.writeTools.map((t) => `${t} (path-scoped)`),
+      ...cfg.shellTools.map((t) => `${t} (command-classified)`),
+    ],
+    unenforced: [
+      "writes issued by MCP servers (not tool calls in this process)",
+      "writes by subprocesses spawned by other extensions",
+      "writes from extensions that return their own tool_call verdict",
+      "in-process mutation via pi.exec or direct fs calls",
+      "shell commands that tokenize to nothing (empty/blank input)",
+    ],
+  };
+}
 
 function targetPathOf(input: any): string | null {
   if (!input || typeof input !== "object") return null;
@@ -367,11 +722,13 @@ function insideArchitecture(p: string): boolean {
 export function evaluateWriteGate(
   state: FleetState,
   toolName: string,
-  input: any
+  input: any,
+  config: GateConfig = loadGateConfig()
 ): { block: true; reason: string } | null {
+  if (!config.enabled) return null;
   const phase = state.currentPhase;
 
-  if (WRITE_TOOLS.has(toolName)) {
+  if (config.writeTools.includes(toolName)) {
     const target = targetPathOf(input);
     if (!target) return null;
 
@@ -417,18 +774,21 @@ export function evaluateWriteGate(
     return null;
   }
 
-  if (toolName === "bash" || toolName === "shell") {
+  if (config.shellTools.includes(toolName)) {
     const cmd = typeof input?.command === "string" ? input.command : "";
     if (!cmd) return null;
-    if (phase < IMPLEMENTATION_PHASE && MUTATING_BASH.some((re) => re.test(cmd))) {
-      return {
-        block: true,
-        reason:
-          `Fleet gate: '${cmd.trim().slice(0, 60)}' mutates state and the job is in Phase ` +
-          `${phase} (${PHASES[phase].label}). Planning artifacts only until Phase ${IMPLEMENTATION_PHASE}.`,
-      };
-    }
-    return null;
+    if (phase >= IMPLEMENTATION_PHASE) return null;
+
+    const hits = classifyCommand(cmd, config.extraMutatingCommands);
+    if (hits.length === 0) return null;
+
+    const why = hits.map((h) => `${h.why} [${h.kind}]`).join(", ");
+    return {
+      block: true,
+      reason:
+        `Fleet gate: '${cmd.trim().slice(0, 60)}' mutates state (${why}) and the job is in ` +
+        `Phase ${phase} (${PHASES[phase].label}). Planning artifacts only until Phase ${IMPLEMENTATION_PHASE}.`,
+    };
   }
 
   return null;
@@ -443,6 +803,38 @@ export function installEnforcement(pi: ExtensionAPI): void {
     if (!verdict) return null;
     audit(`BLOCK ${event.toolName} — ${verdict.reason}`);
     return verdict;
+  });
+
+  // ── Session guards (C3) ────────────────────────────────────────────────
+  //
+  // Narrow on purpose: losing unresolved decisions at contract-freeze time is
+  // unrecoverable; losing them at Phase 2 is not. Never a trap — `sessionGuards:
+  // false` disables it, and every cancel is audited so the block is visible.
+
+  pi.on("session_before_switch", async (_event: any, _ctx: any) => {
+    if (!loadGateConfig().sessionGuards) return null;
+    const state = loadState();
+    if (!state.job.objective) return null;
+    if (state.decisionsRequired.length === 0) return null;
+    if (state.currentPhase < 8) {
+      audit(`session switch allowed at phase ${state.currentPhase} with ${state.decisionsRequired.length} open decision(s)`);
+      return null;
+    }
+    const why =
+      `Fleet gate: ${state.decisionsRequired.length} decision(s) unresolved at Phase ${state.currentPhase} ` +
+      `(${state.decisionsRequired.join(", ")}). Resolving them or setting sessionGuards:false in ` +
+      `${GATE_CONFIG_PATH} allows the switch.`;
+    audit(`session switch cancelled — ${why}`);
+    return { cancel: true, reason: why };
+  });
+
+  pi.on("session_before_fork", async (_event: any, _ctx: any) => {
+    // Fork copies state; losing nothing. Audited, never blocked.
+    const state = loadState();
+    if (state.job.objective) {
+      audit(`session fork allowed at phase ${state.currentPhase}`);
+    }
+    return null;
   });
 }
 

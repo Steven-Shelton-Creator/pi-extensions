@@ -14,8 +14,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
-  DEP_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief,
-} from "./fleet-core.ts";
+  DEP_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief, aborted, ABORTED_RESULT } from "./fleet-core.ts";
 import type { FleetState } from "./fleet-core.ts";
 import { writeFileSync } from "node:fs";
 
@@ -238,7 +237,8 @@ export default function (pi: ExtensionAPI) {
       notes: Type.Optional(Type.String()),
       id: Type.Optional(Type.String()),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = addDependency(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
@@ -257,7 +257,8 @@ export default function (pi: ExtensionAPI) {
       responsibility: Type.Optional(Type.String({ description: "What crosses the boundary" })),
       id: Type.Optional(Type.String()),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const res = addAdapter(loadState(), params as any);
       ctx.ui.notify(res.message, res.ok ? "info" : "error");
       return { content: [{ type: "text", text: res.message }], details: { ok: res.ok } };
@@ -269,7 +270,8 @@ export default function (pi: ExtensionAPI) {
     label: "List Dependencies",
     description: "List every external dependency and whether it is shielded by an adapter.",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
       const state = loadState();
       const list = deps(state);
       const text = list.length === 0

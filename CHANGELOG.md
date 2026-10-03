@@ -22,7 +22,6 @@ only exist because the 0.3.0 gate depends on them, so the two cannot be split.
 ## [0.3.0] — UNRELEASED
 
 **Branch:** `feat/gate-hardening` · **Commits:** `0bb5fff`, `7006a71`
-**Spec:** SPEC.md (reviewed — see REVIEW.md) · **Changes:** CHANGES.md
 **Tests:** 181 assertions, 0 failures (up from 107)
 
 Hardening pass on the 0.2.0 enforcement layer. No new workflow, no new phases.

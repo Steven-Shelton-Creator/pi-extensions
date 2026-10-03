@@ -756,6 +756,89 @@ section("C2 — drift detection");
   check("restoring the document clears drift", clean.details.drift.length === 0, JSON.stringify(clean.details.drift));
 }
 
+// ─── Target directory ────────────────────────────────────────────────────────
+//
+// 'architecture/' is a directory inside the system being architected. It is
+// never the session cwd by assumption, and never a literal /architecture.
+// These tests pin that: the gate must follow the target, not the shell.
+
+section("Target directory is a user input, not the cwd");
+
+const elsewhere = mkdtempSync(join(tmpdir(), "fleet-target-"));
+{
+  const t = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("target is reported", t.details.root === workdir, t.details.root);
+  check("default artifact dir is architecture/", t.details.archDir === "architecture", t.details.archDir);
+  check("inferred from cwd is flagged, not hidden", t.details.inferred === true, JSON.stringify(t.details));
+  check("  report names the inferred source", /inferred/.test(t.text), t.text);
+}
+
+{
+  // Point the architecture at a different tree entirely.
+  const set = await callTool(pi, "fleet_set_target", { root: elsewhere, archDir: "design" }, ctx);
+  check("target can be set to another directory", set.details.ok === true, set.text);
+
+  const t = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("archPath follows the new target", t.details.root === elsewhere, t.details.root);
+  check("archDir name is user-settable", t.details.archDir === "design", t.details.archDir);
+  check("no longer flagged as inferred", t.details.inferred === false, JSON.stringify(t.details));
+
+  // A job must exist inside the new target before the gate has anything to hold.
+  const state = loaded["fleet-core"].emptyState();
+  state.job.objective = "Architect the other tree";
+  state.job.targetRoot = elsewhere;
+  state.job.archDir = "design";
+  loaded["fleet-core"].saveState(state);
+
+  const blocked = await runWriteGate(pi, ctx, "write", {
+    file_path: join(elsewhere, "design", "05_MODULE_REGISTRY.md"),
+    content: "## MOD-001 — Thing",
+  });
+  check("phase-4 artifact gated inside the new target", !!blocked, "expected a block");
+  check("  reason names the owning phase", /belongs to Phase 4/.test(blocked?.reason || ""), blocked?.reason);
+
+  const impl = await runWriteGate(pi, ctx, "write", {
+    file_path: join(elsewhere, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("implementation write gated inside the new target", !!impl, "expected a block");
+  check("  reason names the target, not architecture/", impl?.reason?.includes(elsewhere), impl?.reason);
+
+  // The whole point: a write in the OLD cwd is no longer this job's business.
+  const outOfScope = await runWriteGate(pi, ctx, "write", {
+    file_path: join(workdir, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("write outside the target is not gated as implementation", !outOfScope, JSON.stringify(outOfScope));
+}
+
+{
+  // opt into the stricter reading
+  const set = await callTool(pi, "fleet_set_target", { root: elsewhere, archDir: "design", outOfScope: "block" }, ctx);
+  check("outOfScope=block accepted", set.details.ok === true, set.text);
+
+  const blocked = await runWriteGate(pi, ctx, "write", {
+    file_path: join(workdir, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("outOfScope=block refuses writes outside the target", !!blocked, "expected a block");
+  check("  reason names the boundary", /outside the target/.test(blocked?.reason || ""), blocked?.reason);
+
+  const cov = await callTool(pi, "fleet_gate_coverage", {}, ctx);
+  check("coverage still declares writes outside the target unenforced",
+    cov.details.unenforced.some((u) => /outside the target/.test(u)), JSON.stringify(cov.details.unenforced));
+
+  await callTool(pi, "fleet_set_target", { root: elsewhere, archDir: "design" }, ctx);
+}
+
+{
+  // restore the original target so later sections are unaffected
+  await callTool(pi, "fleet_set_target", { root: workdir }, ctx);
+  rmSync(join(workdir, ".pi", "fleet-target.json"), { force: true });
+  rmSync(join(elsewhere, "design"), { recursive: true, force: true });
+  rmSync(elsewhere, { recursive: true, force: true });
+}
+
 // ─── Done ────────────────────────────────────────────────────────────────────
 
 rmSync(workdir, { recursive: true, force: true });

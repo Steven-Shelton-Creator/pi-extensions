@@ -106,8 +106,215 @@ export function cwd(): string {
   return process.cwd();
 }
 
+// ─── Target ──────────────────────────────────────────────────────────────────
+//
+// `architecture/` describes a *target*: the system being architected. It is not
+// the session's working directory, and it is never the literal `/architecture`.
+// Before this existed, cwd() stood in for the target, which meant the gate
+// governed whatever tree pi happened to be launched in — and, because the gate
+// refused every write outside architecture/, launching pi in $HOME silently
+// put the whole home directory under phase lock.
+//
+// The target is therefore a user input, resolved in this order:
+//
+//   1. FLEET_TARGET                      (environment — one-off or scripted)
+//   2. .pi/fleet-target.json  at cwd    (session intent; committable)
+//   3. .pi/fleet-target.json  at root   (a project carrying its own identity)
+//   4. the job's pinned target           (recorded at /fleet:new-job)
+//   5. cwd, flagged `inferred`           (never silent — see targetStatus)
+//
+// ARCH_DIR remains the default *name* of the artifact directory inside the
+// target, and is overridable per-target for stations with their own convention.
+
+export const TARGET_CONFIG_PATH = ".pi/fleet-target.json";
+
+/** What the gate does with a write that lands outside the target. */
+export type OutOfScopePolicy = "audit" | "block";
+
+export interface TargetConfig {
+  /** Absolute path to the system being architected. */
+  root: string;
+  /** Artifact directory name, relative to root. */
+  archDir: string;
+  /** Handling of writes outside `root`. */
+  outOfScope: OutOfScopePolicy;
+  /** Where the value came from — surfaced, never hidden. */
+  source: "env" | "config-cwd" | "config-root" | "job" | "inferred";
+  /** True when no source declared a target and cwd was assumed. */
+  inferred: boolean;
+}
+
+export const DEFAULT_ARCH_DIR = ARCH_DIR;
+export const DEFAULT_OUT_OF_SCOPE: OutOfScopePolicy = "audit";
+
+let cachedTarget: { key: string; config: TargetConfig } | null = null;
+
+function readTargetConfigFile(at: string): { root?: string; archDir?: string; outOfScope?: string } | null {
+  const p = join(at, TARGET_CONFIG_PATH);
+  try {
+    if (!existsSync(p)) return null;
+    const raw = JSON.parse(readFileSync(p, "utf8"));
+    return raw && typeof raw === "object" ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeOutOfScope(v: unknown): OutOfScopePolicy {
+  return v === "block" ? "block" : DEFAULT_OUT_OF_SCOPE;
+}
+
+interface PinnedTarget {
+  root: string;
+  archDir: string;
+  outOfScope?: string;
+  source: "config-root" | "config-cwd" | "job";
+}
+
+/**
+ * Read a target declared by something other than cwd's config file — either a
+ * `.pi/fleet-target.json` sitting in the target it names, or the target pinned
+ * inside an existing job store. Both are located by direct path from cwd.
+ */
+function readPinnedTarget(here: string): PinnedTarget | null {
+  // The store may sit under a non-default archDir; collect both candidates.
+  const archDirs = new Set<string>([DEFAULT_ARCH_DIR]);
+  const cfg = readTargetConfigFile(here);
+  if (cfg?.archDir?.trim()) archDirs.add(cfg.archDir.trim());
+
+  for (const dir of archDirs) {
+    const storePath = join(here, dir, STORE_FILE);
+    try {
+      if (!existsSync(storePath)) continue;
+      const job = JSON.parse(readFileSync(storePath, "utf8"))?.job;
+      if (!job?.targetRoot) continue;
+      return {
+        root: resolve(here, job.targetRoot),
+        archDir: job.archDir?.trim() || dir,
+        outOfScope: job.out_of_scope,
+        source: "job",
+      };
+    } catch {
+      /* unreadable or corrupt store — keep looking */
+    }
+  }
+
+  // No job yet: a config file at cwd may name a root that carries its own copy.
+  if (cfg?.root) {
+    const root = resolve(here, cfg.root);
+    const own = readTargetConfigFile(root);
+    if (own && root !== here) {
+      return {
+        root: resolve(root, own.root || "."),
+        archDir: own.archDir?.trim() || cfg.archDir?.trim() || DEFAULT_ARCH_DIR,
+        outOfScope: own.outOfScope ?? cfg.outOfScope,
+        source: "config-root",
+      };
+    }
+    return {
+      root,
+      archDir: cfg.archDir?.trim() || DEFAULT_ARCH_DIR,
+      outOfScope: cfg.outOfScope,
+      source: "config-cwd",
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Resolve the target. Pure with respect to the filesystem — it reads config but
+ * creates nothing, so it is safe to call from the tool_call hook.
+ */
+export function targetConfig(): TargetConfig {
+  const here = cwd();
+  const envRoot = process.env.FLEET_TARGET?.trim();
+
+  if (envRoot) {
+    return { root: resolve(here, envRoot), archDir: DEFAULT_ARCH_DIR, outOfScope: DEFAULT_OUT_OF_SCOPE, source: "env", inferred: false };
+  }
+
+  for (const [at, source] of [[here, "config-cwd"]] as const) {
+    const raw = readTargetConfigFile(at);
+    if (raw?.root) {
+      return {
+        root: resolve(at, raw.root),
+        archDir: raw.archDir?.trim() || DEFAULT_ARCH_DIR,
+        outOfScope: normalizeOutOfScope(raw.outOfScope),
+        source,
+        inferred: false,
+      };
+    }
+  }
+
+  // A project may carry its own identity, and an existing job pins its target
+  // at /fleet:new-job. Both are read by path from cwd — never through
+  // archDirName(), which would resolve the target by asking the target.
+  const pinned = readPinnedTarget(here);
+  if (pinned) {
+    return {
+      root: pinned.root,
+      archDir: pinned.archDir,
+      outOfScope: normalizeOutOfScope(pinned.outOfScope),
+      source: pinned.source,
+      inferred: false,
+    };
+  }
+
+  return { root: here, archDir: DEFAULT_ARCH_DIR, outOfScope: DEFAULT_OUT_OF_SCOPE, source: "inferred", inferred: true };
+}
+
+function keyFor(cfg: TargetConfig): string {
+  return `${cfg.root}|${cfg.archDir}|${cfg.outOfScope}|${cfg.source}`;
+}
+
+function targetConfigCached(): TargetConfig {
+  const cfg = targetConfig();
+  if (cachedTarget && cachedTarget.key === keyFor(cfg)) return cachedTarget.config;
+  cachedTarget = { key: keyFor(cfg), config: cfg };
+  return cfg;
+}
+
+/** Drop the memoized target. Required after anything writes a target config. */
+export function resetTargetCache(): void {
+  cachedTarget = null;
+}
+
+/** Absolute path to the system being architected. */
+export function targetRoot(): string {
+  return targetConfigCached().root;
+}
+
+/** Name of the artifact directory inside the target. */
+export function archDirName(): string {
+  return targetConfigCached().archDir;
+}
+
+/**
+ * Path relative to the target root, or null when the path lies outside it.
+ * The root itself yields "" — inside, and not inside any subdirectory.
+ */
+export function relToTarget(p: string): string | null {
+  const abs = resolve(targetRoot(), p);
+  const rel = relative(targetRoot(), abs);
+  if (rel === "") return "";
+  if (rel.startsWith("..") || rel.startsWith("/") || /^[A-Za-z]:/.test(rel)) return null;
+  return rel;
+}
+
+export function isInsideTarget(p: string): boolean {
+  return relToTarget(p) !== null;
+}
+
+/** One line naming the target and where it came from. Never empty. */
+export function targetStatus(): string {
+  const t = targetConfigCached();
+  const where = t.source === "inferred" ? "inferred from cwd — set a target" : `from ${t.source}`;
+  return `Target: ${t.root} · artifacts in ${t.archDir}/ · ${where}`;
+}
+
 export function archPath(...parts: string[]): string {
-  return join(cwd(), ARCH_DIR, ...parts);
+  return join(targetRoot(), archDirName(), ...parts);
 }
 
 export function ensureArchDir(): string {
@@ -120,6 +327,10 @@ export function ensureArchDir(): string {
 
 export interface Job {
   objective: string;
+  /** Absolute path to the system this job architectures. Pinned at /fleet:new-job. */
+  targetRoot: string;
+  /** Artifact directory name inside the target. Defaults to ARCH_DIR. */
+  archDir: string;
   scope: string[];
   non_goals: string[];
   source_material: string[];
@@ -172,7 +383,8 @@ export interface FleetState {
   migrationPhases?: any[];
   compatMappings?: any[];
   tooling?: any[];
-  verification?: { ranAt?: string; summary?: string; results?: any[] } | null;
+  /** `phase` is written by fleet-verify and read by the gate's staleness check. */
+  verification?: { ranAt?: string; phase?: number; summary?: string; results?: any[] } | null;
   decisions?: Record<string, Decision>;
 }
 
@@ -180,6 +392,8 @@ export function emptyState(): FleetState {
   return {
     job: {
       objective: "",
+      targetRoot: "",
+      archDir: DEFAULT_ARCH_DIR,
       scope: [],
       non_goals: [],
       source_material: [],
@@ -745,6 +959,7 @@ export function gateCoverage(): GateCoverage {
       ...cfg.shellTools.map((t) => `${t} (command-classified)`),
     ],
     unenforced: [
+      "writes outside the target directory (out-of-scope policy 'audit' — recorded, not blocked)",
       "writes issued by MCP servers (not tool calls in this process)",
       "writes by subprocesses spawned by other extensions",
       "writes from extensions that return their own tool_call verdict",
@@ -763,8 +978,11 @@ function targetPathOf(input: any): string | null {
 }
 
 function insideArchitecture(p: string): boolean {
-  const rel = relative(archPath(), resolve(cwd(), p));
-  return !rel.startsWith("..") && !rel.startsWith("/") && rel !== "";
+  // Scoped to the target, not to cwd: architecture/ is a directory *inside* the
+  // system being architected, wherever that system happens to live.
+  const abs = resolve(targetRoot(), p);
+  const rel = relative(archPath(), abs);
+  return rel !== "" && !rel.startsWith("..") && !rel.startsWith("/");
 }
 
 /**
@@ -815,13 +1033,29 @@ export function evaluateWriteGate(
       return null;
     }
 
-    // Implementation code requires frozen contracts.
+    // Implementation code requires frozen contracts — but only *within* the
+    // target. A write outside the target is not this job's business, so it is
+    // recorded rather than refused unless the policy says otherwise.
     if (phase < IMPLEMENTATION_PHASE) {
+      const rel = relToTarget(target);
+      if (rel === null) {
+        if (targetConfigCached().outOfScope === "block") {
+          return {
+            block: true,
+            reason:
+              `Fleet gate: ${target} is outside the target ` +
+              `(${targetRoot()}) and the job is in Phase ${phase} ` +
+              `(${PHASES[phase].label}). outOfScope is 'block'. ` +
+              `Widen the target with /fleet:target <path>, or write to the project.`,
+          };
+        }
+        return null;
+      }
       return {
         block: true,
         reason:
           `Fleet gate: the job is in Phase ${phase} (${PHASES[phase].label}). ` +
-          `Implementation writes outside ${ARCH_DIR}/ are only permitted from Phase ` +
+          `Implementation writes inside ${targetRoot()} are only permitted from Phase ` +
           `${IMPLEMENTATION_PHASE} (CONTRACT FREEZE), reached via fleet_advance_phase.`,
       };
     }
@@ -855,7 +1089,17 @@ export function installEnforcement(pi: ExtensionAPI): void {
     const state = loadState();
     if (!state.job.objective) return null; // no job — nothing to enforce
     const verdict = evaluateWriteGate(state, event.toolName, event.input);
-    if (!verdict) return null;
+    if (!verdict) {
+      // Out-of-scope writes are allowed but never invisible.
+      if (targetConfigCached().outOfScope === "audit" &&
+          loadGateConfig().writeTools.includes(event.toolName)) {
+        const t = targetPathOf(event.input);
+        if (t && relToTarget(t) === null) {
+          audit(`OUT-OF-SCOPE ${event.toolName} ${t} (target: ${targetRoot()})`, state);
+        }
+      }
+      return null;
+    }
     audit(`BLOCK ${event.toolName} — ${verdict.reason}`);
     return verdict;
   });
@@ -902,6 +1146,7 @@ export function phaseBrief(state: FleetState): string {
   const lines: string[] = [];
   lines.push(`## Macro Architecture Fleet — active`);
   lines.push(`Job: ${state.job.objective}`);
+  lines.push(`Target: ${targetRoot()} (artifacts in ${archDirName()}/)`);
   lines.push(`Current phase: ${state.currentPhase} (${phase.label})`);
 
   const next = state.currentPhase + 1;
@@ -916,11 +1161,13 @@ export function phaseBrief(state: FleetState): string {
   if (state.decisionsRequired.length > 0) {
     lines.push(`Decisions awaiting a human: ${state.decisionsRequired.join(", ")} — do not guess, surface them.`);
   }
-  if (phase.currentPhase >= FREEZE_PHASE) {
-    lines.push(`Contracts are frozen. Design artifacts in ${ARCH_DIR}/ are immutable; propose changes as decisions.`);
+  if (state.currentPhase >= FREEZE_PHASE) {
+    lines.push(`Contracts are frozen. Design artifacts in ${archDirName()}/ are immutable; propose changes as decisions.`);
   }
   lines.push(
-    `Write flow: use the fleet_* tools to record architecture. Direct writes to ${ARCH_DIR}/ are gated by phase.`
+    `Write flow: use the fleet_* tools to record architecture. Direct writes to ` +
+    `${targetRoot()}/${archDirName()}/ are gated by phase; writes elsewhere in the target ` +
+    `need Phase ${IMPLEMENTATION_PHASE}. Writes outside the target are out of scope.`
   );
   return lines.join("\n");
 }

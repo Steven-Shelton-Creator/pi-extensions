@@ -31,16 +31,62 @@ Concretely:
 
 Everything in this repo is built on the second row.
 
+## The target is a directory, not an assumption
+
+`architecture/` is a directory **inside the system being architected**. It is not the session's working directory, and it is never a literal `/architecture`.
+
+Earlier versions used `process.cwd()` as the target. That made the gate govern whatever tree pi happened to be launched in, and — because the gate refused every write *outside* `architecture/` — launching pi in `$HOME` silently put an entire home directory under phase lock.
+
+The target is now a user input, resolved in this order:
+
+| # | Source | Notes |
+| --- | --- | --- |
+| 1 | `FLEET_TARGET` env var | one-off or scripted runs |
+| 2 | `.pi/fleet-target.json` at cwd | session intent; committable |
+| 3 | `.pi/fleet-target.json` at the target | a project carrying its own identity |
+| 4 | the job's pinned target | recorded at `/fleet:new-job` |
+| 5 | cwd | flagged `inferred` — never silent |
+
+Resolution is reported by `fleet_describe_target` and shown in `/fleet:status`, so a fallback to cwd is always visible:
+
+```text
+Target:    /home/steven/projects/ghoststack
+Artifacts: /home/steven/projects/ghoststack/architecture/
+Resolved from: config-cwd
+```
+
+Point the architecture somewhere else with `/fleet:target <path> [archDir]`, or `fleet_set_target`. `archDir` is configurable too, for stations with their own convention:
+
+```json
+// .pi/fleet-target.json
+{
+  "root": "/home/steven/projects/ghoststack",
+  "archDir": "architecture",
+  "outOfScope": "audit"
+}
+```
+
+`/fleet:new-job` asks for the target before writing anything and pins it into the store, so the gate cannot drift onto another tree mid-job.
+
+### Writes outside the target
+
+The gate's scope is the **target**, so the meaningful question is "is this write inside the project being architected?" — not "is this write outside `architecture/`?".
+
+- **`outOfScope: "audit"`** (default) — a write outside the target is allowed and appended to `architecture/fleet-audit.log` as `OUT-OF-SCOPE`. Recorded, never invisible.
+- **`outOfScope: "block"`** — out-of-target writes are refused before the implementation phase, preserving the old conservative reading.
+
+Either way the narrowing is declared in `fleet_gate_coverage`'s `unenforced` list, because a guarantee that does not say where it stops is not a guarantee.
+
 ## What the gate actually blocks
 
 Once a job is initialized, `fleet-core`'s `evaluateWriteGate` refuses:
 
 - **Writing an artifact before its phase.** `05_MODULE_REGISTRY.md` belongs to Phase 4; attempting it at Phase 0 is refused with the reason naming the owning phase.
-- **Writing implementation code before contract freeze.** Any `write`/`edit` outside `architecture/` is refused until Phase 10.
+- **Writing implementation code before contract freeze.** Any `write`/`edit` inside the target but outside the artifact directory is refused until Phase 10.
 - **Mutating state early.** `git commit`, `rm -r`, `npm install`, `curl … | sh` and similar are refused before Phase 10.
 - **Editing frozen contracts.** After `/fleet:contract-freeze`, design artifacts are immutable. Changes go through a decision.
 
-Reads are never gated. Every block is appended to `architecture/fleet-audit.log`, and a deliberate bypass is recorded with `/fleet:override <rule> <reason>` rather than left unlogged.
+Reads are never gated. Every block is appended to `<target>/<archDir>/fleet-audit.log`, and a deliberate bypass is recorded with `/fleet:override <rule> <reason>` rather than left unlogged.
 
 ## Gates are evaluated against artifacts, not bookkeeping
 
@@ -182,6 +228,8 @@ Optional. Absent file ⇒ defaults, which reproduce the ungated behaviour of an 
   "sessionGuards": true
 }
 ```
+
+The target is configured separately, in `.pi/fleet-target.json` — see [The target is a directory, not an assumption](#the-target-is-a-directory-not-an-assumption). Keeping them apart matters: `fleet-gate.json` says *how hard to enforce*, `fleet-target.json` says *what to enforce it over*.
 
 ## License
 

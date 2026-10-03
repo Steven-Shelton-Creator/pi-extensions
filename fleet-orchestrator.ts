@@ -25,14 +25,69 @@ import { Type } from "@sinclair/typebox";
 import {
   PHASES, MAX_PHASE, FREEZE_PHASE,
   JOB_FILE, DECISION_FILE, AUDIT_FILE, OVERRIDE_FILE,
-  archPath, ensureArchDir,
+  archPath, ensureArchDir, cwd,
   loadState, saveState, audit, emptyState,
   gateForPhase, artifactStatus, installEnforcement, phaseBrief, aborted, ABORTED_RESULT,
   gateCoverage, GATE_CONFIG_PATH,
+  targetConfig, targetRoot, archDirName, targetStatus, relToTarget, resetTargetCache,
+  TARGET_CONFIG_PATH, DEFAULT_ARCH_DIR,
 } from "./fleet-core.ts";
 import type { FleetState, Decision } from "./fleet-core.ts";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { join, resolve, isAbsolute } from "node:path";
+
+// ─── Target ─────────────────────────────────────────────────────────────────
+
+interface SetTargetResult {
+  ok: boolean;
+  message: string;
+  root: string;
+  archDir: string;
+  wrote: boolean;
+}
+
+/**
+ * Point the architecture at a directory. Relative paths resolve against cwd,
+ * which is a convenience for typing — not the source of truth: the resolved
+ * absolute path is what gets persisted, so the target cannot drift with the
+ * shell that happened to launch pi.
+ */
+function setTarget(root: string, archDir?: string, outOfScope?: string): SetTargetResult {
+  const abs = resolve(cwd(), root.trim());
+  if (!existsSync(abs)) {
+    return { ok: false, message: `Target does not exist: ${abs}`, root: abs, archDir: DEFAULT_ARCH_DIR, wrote: false };
+  }
+  if (!isDirectory(abs)) {
+    return { ok: false, message: `Target is not a directory: ${abs}`, root: abs, archDir: DEFAULT_ARCH_DIR, wrote: false };
+  }
+  const dir = (archDir?.trim() || archDirName()).replace(/^\/+|\/+$/g, "") || DEFAULT_ARCH_DIR;
+  if (isAbsolute(dir) || dir.split("/").includes("..")) {
+    return { ok: false, message: `Architecture directory must be a relative name inside the target: ${dir}`, root: abs, archDir: dir, wrote: false };
+  }
+  const scope = outOfScope === "block" ? "block" : "audit";
+
+  const cfgPath = join(cwd(), TARGET_CONFIG_PATH);
+  mkdirSync(join(cwd(), ".pi"), { recursive: true });
+  writeFileSync(cfgPath, JSON.stringify({ root: abs, archDir: dir, outOfScope: scope }, null, 2) + "\n", "utf8");
+
+  // The resolved target is process-wide; drop the memo so the next read sees it.
+  resetTargetCache();
+  return {
+    ok: true,
+    message: `Target: ${abs} · artifacts in ${dir}/ · out-of-scope writes: ${scope}`,
+    root: abs,
+    archDir: dir,
+    wrote: true,
+  };
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 // ─── Writers ─────────────────────────────────────────────────────────────────
 
@@ -274,6 +329,20 @@ export default function (pi: ExtensionAPI) {
         if (!ok) return;
       }
       const fresh = emptyState();
+
+      // The target is a user input, not a guess: ask before anything is written,
+      // and pin it into the job so the gate cannot drift onto another tree.
+      const suggested = targetStatus();
+      const t = await ctx.ui.input(`Target directory (${suggested})`, targetRoot());
+      const root = t?.trim() ? resolve(cwd(), t.trim()) : targetRoot();
+      if (!existsSync(root)) {
+        ctx.ui.notify(`Target does not exist: ${root}`, "warning");
+        return;
+      }
+      fresh.job.targetRoot = root;
+      const ad = await ctx.ui.input("Architecture directory name", archDirName());
+      if (ad?.trim()) fresh.job.archDir = ad.trim().replace(/^\/+|\/+$/g, "") || DEFAULT_ARCH_DIR;
+
       fresh.job.objective = args.trim();
 
       const scope = await ctx.ui.input("Scope items (comma-separated)", "");
@@ -289,6 +358,30 @@ export default function (pi: ExtensionAPI) {
       writeJobFile(fresh);
       audit(`job created: ${fresh.job.objective}`, fresh);
       ctx.ui.notify(`[fleet] Job created: "${fresh.job.objective}"`, "info");
+    },
+  });
+
+  pi.registerCommand("fleet:target", {
+    description: "Show or set the target directory the architecture describes",
+    handler: async (args, ctx) => {
+      const arg = args?.trim();
+      if (!arg) {
+        ctx.ui.notify(targetStatus(), "info");
+        return;
+      }
+      const res = setTarget(arg);
+      if (!res.ok) {
+        ctx.ui.notify(res.message, "warning");
+        return;
+      }
+      const state = loadState();
+      if (state.job.objective) {
+        state.job.targetRoot = res.root;
+        state.job.archDir = res.archDir;
+        saveState(state);
+      }
+      audit(`target set: ${res.root} (artifacts ${res.archDir}/)${res.wrote ? " via " + TARGET_CONFIG_PATH : ""}`, state);
+      ctx.ui.notify(`[fleet] ${res.message}`, "info");
     },
   });
 
@@ -425,6 +518,50 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ─── Tools ─────────────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "fleet_describe_target",
+    label: "Describe Target",
+    description:
+      "Report which directory the architecture describes, where the artifact directory sits inside it, and how the gate treats writes outside it. Call this before writing anything: 'architecture/' is a directory inside the target, never the session's working directory by assumption.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _onUpdate, _ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
+      const t = targetConfig();
+      const text = [
+        `Target:  ${t.root}`,
+        `Artifacts: ${join(t.root, t.archDir)}/`,
+        `Resolved from: ${t.source}${t.inferred ? "  ⚠ no target declared — inferred from cwd" : ""}`,
+        `Out-of-scope writes: ${t.outOfScope === "block" ? "blocked before implementation phase" : "allowed, recorded in the audit log"}`,
+      ].join("\n");
+      return { content: [{ type: "text", text }], details: { ...t } };
+    },
+  });
+
+  pi.registerTool({
+    name: "fleet_set_target",
+    label: "Set Target",
+    description:
+      "Point the architecture at a different directory. Use when the system being architected is not the directory pi was launched in. Writes .pi/fleet-target.json so the target survives the session.",
+    parameters: Type.Object({
+      root: Type.String({ description: "Absolute path, or relative to the current directory, of the system being architected." }),
+      archDir: Type.Optional(Type.String({ description: "Artifact directory name inside the target. Default 'architecture'." })),
+      outOfScope: Type.Optional(Type.String({ description: "'audit' (default) records writes outside the target; 'block' refuses them before the implementation phase." })),
+    }),
+    async execute(_id, params, signal, _onUpdate, _ctx) {
+      if (aborted(signal)) return ABORTED_RESULT;
+      const res = setTarget(String(params.root), params.archDir, params.outOfScope);
+      if (!res.ok) return { content: [{ type: "text", text: res.message }], details: { ok: false, message: res.message } };
+      const state = loadState();
+      if (state.job.objective) {
+        state.job.targetRoot = res.root;
+        state.job.archDir = res.archDir;
+        saveState(state);
+      }
+      audit(`target set: ${res.root} (artifacts ${res.archDir}/)${res.wrote ? " via " + TARGET_CONFIG_PATH : ""}`, state);
+      return { content: [{ type: "text", text: res.message }], details: { ok: true, ...res } };
+    },
+  });
 
   pi.registerTool({
     name: "fleet_gate_coverage",

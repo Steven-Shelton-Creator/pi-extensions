@@ -25,6 +25,52 @@ changed history, not content: `git diff` before and after was empty.
 
 ---
 
+## [Unreleased] — target directory
+
+**Branch:** `fc/target-directory` · **Tests:** 198 assertions, 0 failures (up from 181)
+
+`architecture/` is now a directory inside the system being architected, and the
+target is a user input rather than an assumption.
+
+### Fixed
+
+- **The gate governed whatever tree pi was launched in (High).** `cwd()` returned
+  `process.cwd()` and stood in for the target. Two consequences: the gate locked
+  down a tree the user never named, and because `evaluateWriteGate` refused every
+  write *outside* `architecture/`, launching pi in `$HOME` silently placed an
+  entire home directory under phase lock. Same class as the 0.1.0 self-seeding
+  and 0.3.0 stale-verdict defects: the gate trusting a value that does not
+  describe what the user meant. The target is now resolved from `FLEET_TARGET`,
+  `.pi/fleet-target.json`, or the job's pinned target, with a cwd fallback that
+  is always flagged `inferred` and surfaced by `fleet_describe_target`.
+- **Scope is now the target, not the artifact directory.** The gate's question
+  changes from "is this write outside `architecture/`?" to "is this write inside
+  the project being architected?" — so pointing a job at another tree no longer
+  gates the old one and leaves the new one open. `archDir` is configurable too.
+- **Phase brief said `architecture/` when the target was elsewhere.** The brief
+  and the gate's block reasons now name the resolved target and artifact path.
+- **`phaseBrief` never announced frozen contracts.** `phase.currentPhase` read a
+  property that `PhaseDef` does not have, so the guard was always `undefined`
+  and the frozen-contracts reminder never fired. (`state.currentPhase` was meant.)
+
+### Added
+
+- `/fleet:target [path] [archDir]`, `fleet_set_target`, `fleet_describe_target`.
+- `outOfScope` policy: `audit` (default — out-of-target writes are allowed and
+  logged as `OUT-OF-SCOPE`) or `block` (the previous conservative reading).
+- 17 assertions covering target resolution, artifact gating inside a retargeted
+  job, and both out-of-scope policies.
+
+### Notes
+
+- Narrowing the gate's reach is itself a change in what the gate promises, so it
+  is declared in `fleet_gate_coverage`'s `unenforced` list rather than left to be
+  discovered.
+- `fleet:new-job` now asks for the target before writing anything and pins it into
+  the store, so the target cannot drift onto another tree mid-job.
+
+---
+
 ## [0.3.0] — 2026-10-03
 
 **On `main`:** `ce1da26` (tip) · **Feature commits:** `57e44d0`, `d6b4d05`

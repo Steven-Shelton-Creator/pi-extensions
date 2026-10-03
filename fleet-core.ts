@@ -145,7 +145,11 @@ export interface TargetConfig {
 }
 
 export const DEFAULT_ARCH_DIR = ARCH_DIR;
-export const DEFAULT_OUT_OF_SCOPE: OutOfScopePolicy = "audit";
+// Default is deny, not audit. An out-of-target write is out of this job's
+// business either way, but "recorded" is a promise the agent can fulfil later
+// and usually does not; "refused" is a boundary that holds on the first try.
+// Widen deliberately with `outOfScope: "audit"` when auditing is what you want.
+export const DEFAULT_OUT_OF_SCOPE: OutOfScopePolicy = "block";
 
 let cachedTarget: { key: string; config: TargetConfig } | null = null;
 
@@ -161,7 +165,10 @@ function readTargetConfigFile(at: string): { root?: string; archDir?: string; ou
 }
 
 function normalizeOutOfScope(v: unknown): OutOfScopePolicy {
-  return v === "block" ? "block" : DEFAULT_OUT_OF_SCOPE;
+  // Honour 'audit' explicitly. Falling through to the default for anything
+  // that is not 'block' makes 'audit' unreachable the moment the default is
+  // 'block' — the lenient policy would silently be a deny policy.
+  return v === "audit" ? "audit" : DEFAULT_OUT_OF_SCOPE;
 }
 
 interface PinnedTarget {
@@ -891,6 +898,10 @@ export interface GateConfig {
   shellTools: string[];
   extraMutatingCommands: Record<string, string[]>;
   sessionGuards: boolean;
+  /** Refuse writes when the target was only inferred from cwd, never declared. */
+  requireDeclaredTarget: boolean;
+  /** Freeze a job's target once it exists. More repositories means more agents. */
+  pinTarget: boolean;
 }
 
 export const DEFAULT_GATE_CONFIG: GateConfig = {
@@ -899,6 +910,8 @@ export const DEFAULT_GATE_CONFIG: GateConfig = {
   shellTools: DEFAULT_SHELL_TOOLS,
   extraMutatingCommands: {},
   sessionGuards: true,
+  requireDeclaredTarget: true,
+  pinTarget: true,
 };
 
 let cachedConfig: { mtime: number; config: GateConfig } | null = null;
@@ -925,6 +938,8 @@ export function loadGateConfig(): GateConfig {
         extraMutatingCommands: raw.extraMutatingCommands && typeof raw.extraMutatingCommands === "object"
           ? raw.extraMutatingCommands : {},
         sessionGuards: raw.sessionGuards !== false,
+        requireDeclaredTarget: raw.requireDeclaredTarget !== false,
+        pinTarget: raw.pinTarget !== false,
       },
     };
     return cachedConfig.config;
@@ -959,7 +974,7 @@ export function gateCoverage(): GateCoverage {
       ...cfg.shellTools.map((t) => `${t} (command-classified)`),
     ],
     unenforced: [
-      "writes outside the target directory (out-of-scope policy 'audit' — recorded, not blocked)",
+      "writes outside the target when outOfScope is 'audit' (default is 'block' — refused before the implementation phase)",
       "writes issued by MCP servers (not tool calls in this process)",
       "writes by subprocesses spawned by other extensions",
       "writes from extensions that return their own tool_call verdict",
@@ -1004,6 +1019,19 @@ export function evaluateWriteGate(
   if (config.writeTools.includes(toolName)) {
     const target = targetPathOf(input);
     if (!target) return null;
+
+    // An inferred target is not an assignment. If nothing declared a target,
+    // cwd is standing in for one — the same defect class as the 0.1.0
+    // self-seeding and 0.3.0 stale-verdict bugs. Refuse, and say how to fix it.
+    if (config.requireDeclaredTarget && targetConfigCached().inferred) {
+      return {
+        block: true,
+        reason:
+          `Fleet gate: no target is declared, so the target is inferred from the ` +
+          `working directory (${cwd()}) and nothing here has been assigned. Declare one ` +
+          `with /fleet:target <path>, the fleet_set_target tool, or FLEET_TARGET.`,
+      };
+    }
 
     if (insideArchitecture(target)) {
       const file = target.split(/[\\/]/).pop() || "";

@@ -30,6 +30,7 @@ import {
   gateForPhase, artifactStatus, installEnforcement, phaseBrief, aborted, ABORTED_RESULT,
   gateCoverage, GATE_CONFIG_PATH,
   targetConfig, targetRoot, archDirName, targetStatus, relToTarget, resetTargetCache,
+  loadGateConfig,
   TARGET_CONFIG_PATH, DEFAULT_ARCH_DIR,
 } from "./fleet-core.ts";
 import type { FleetState, Decision } from "./fleet-core.ts";
@@ -53,6 +54,23 @@ interface SetTargetResult {
  * shell that happened to launch pi.
  */
 function setTarget(root: string, archDir?: string, outOfScope?: string): SetTargetResult {
+  // A job's target is pinned at /fleet:new-job. Re-pointing it mid-job would
+  // move the boundary underneath the work already recorded against it — so the
+  // answer to "I need another repository" is another agent, not a wider gate.
+  const existing = loadState();
+  if (existing.job.objective && loadGateConfig().pinTarget) {
+    const pinned = existing.job.targetRoot || targetRoot();
+    return {
+      ok: false,
+      message:
+        `Fleet gate: this job is pinned to ${pinned}. A running job's target is ` +
+        `immutable — working a second repository means a second agent, not a ` +
+        `retargeted one. (Set pinTarget:false in ${GATE_CONFIG_PATH} to allow.)`,
+      root: targetRoot(),
+      archDir: archDirName(),
+      wrote: false,
+    };
+  }
   const abs = resolve(cwd(), root.trim());
   if (!existsSync(abs)) {
     return { ok: false, message: `Target does not exist: ${abs}`, root: abs, archDir: DEFAULT_ARCH_DIR, wrote: false };

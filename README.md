@@ -45,7 +45,7 @@ The target is now a user input, resolved in this order:
 | 2 | `.pi/fleet-target.json` at cwd | session intent; committable |
 | 3 | `.pi/fleet-target.json` at the target | a project carrying its own identity |
 | 4 | the job's pinned target | recorded at `/fleet:new-job` |
-| 5 | cwd | flagged `inferred` — never silent |
+| 5 | cwd | flagged `inferred` — refused for writing unless `requireDeclaredTarget` is off |
 
 Resolution is reported by `fleet_describe_target` and shown in `/fleet:status`, so a fallback to cwd is always visible:
 
@@ -62,7 +62,7 @@ Point the architecture somewhere else with `/fleet:target <path> [archDir]`, or 
 {
   "root": "/home/steven/projects/ghoststack",
   "archDir": "architecture",
-  "outOfScope": "audit"
+  "outOfScope": "block"
 }
 ```
 
@@ -72,10 +72,22 @@ Point the architecture somewhere else with `/fleet:target <path> [archDir]`, or 
 
 The gate's scope is the **target**, so the meaningful question is "is this write inside the project being architected?" — not "is this write outside `architecture/`?".
 
-- **`outOfScope: "audit"`** (default) — a write outside the target is allowed and appended to `architecture/fleet-audit.log` as `OUT-OF-SCOPE`. Recorded, never invisible.
-- **`outOfScope: "block"`** — out-of-target writes are refused before the implementation phase, preserving the old conservative reading.
+- **`outOfScope: "block"`** (default) — out-of-target writes are refused before the implementation phase. Deny by default: "recorded" is a promise an agent can defer, "refused" holds on the first try.
+- **`outOfScope: "audit"`** — a write outside the target is allowed and appended to `<target>/<archDir>/fleet-audit.log` as `OUT-OF-SCOPE`. Recorded, never invisible. Opt in deliberately.
 
-Either way the narrowing is declared in `fleet_gate_coverage`'s `unenforced` list, because a guarantee that does not say where it stops is not a guarantee.
+Either way the boundary is declared in `fleet_gate_coverage`'s `unenforced` list, because a guarantee that does not say where it stops is not a guarantee.
+
+### An inferred target is not an assignment
+
+If nothing declared a target, resolution falls back to cwd and flags the result `inferred`. By default that fallback is **not good enough to write into**: `requireDeclaredTarget` refuses writes until a real target is declared, with a reason naming the three ways to declare one.
+
+An unassigned agent has no business writing anywhere, and cwd is the one directory that was never chosen by anyone.
+
+### A running job's target is immutable
+
+`pinTarget` refuses `/fleet:target` and `fleet_set_target` while a job exists. The pinned target is part of the job's record, and moving it would relocate the boundary underneath work already recorded against it.
+
+Working a second repository means a second agent, not a retargeted one.
 
 ## What the gate actually blocks
 
@@ -194,7 +206,7 @@ Markdown in `architecture/` is a rendered view of the store, not the source of t
 node test/smoke.mjs
 ```
 
-181 assertions covering the write gate, phase gates, freeze immutability, the decision queue, the shell classifier (including command substitution, pipe destinations, and the documented false positives that must *not* block), gate coverage, abort handling, session guards, rewind invalidation, and drift detection.
+209 assertions covering the write gate, phase gates, freeze immutability, the decision queue, the shell classifier (including command substitution, pipe destinations, and the documented false positives that must *not* block), gate coverage, abort handling, session guards, rewind invalidation, drift detection, and the three confinement toggles (`requireDeclaredTarget`, `pinTarget`, `outOfScope`).
 
 The suite catches dangling references, dependency cycles, and leaky contracts
 each producing `REJECT` and each blocking the advance to Phase 8.
@@ -216,7 +228,7 @@ Worth stating plainly.
 
 ## Configuration
 
-Optional. Absent file ⇒ defaults, which reproduce the ungated behaviour of an earlier release.
+Optional. Absent file ⇒ defaults, which are the strict reading. Every toggle is a boundary that holds by default; loosen one deliberately.
 
 ```json
 // .pi/fleet-gate.json
@@ -225,11 +237,23 @@ Optional. Absent file ⇒ defaults, which reproduce the ungated behaviour of an 
   "writeTools": ["write", "edit", "multi_edit", "patch", "apply_patch"],
   "shellTools": ["bash", "shell"],
   "extraMutatingCommands": { "terraform": ["apply", "destroy"] },
-  "sessionGuards": true
+  "sessionGuards": true,
+  "requireDeclaredTarget": true,
+  "pinTarget": true
 }
 ```
 
+| key | default | what it holds |
+|---|---|---|
+| `enabled` | `true` | the gate runs at all |
+| `requireDeclaredTarget` | `true` | no writes under a target merely inferred from cwd |
+| `pinTarget` | `true` | a running job's target cannot be re-pointed |
+| `sessionGuards` | `true` | refuse a session switch that drops unresolved decisions |
+| `outOfScope` (in the target file) | `"block"` | out-of-target writes are refused, not merely logged |
+
 The target is configured separately, in `.pi/fleet-target.json` — see [The target is a directory, not an assumption](#the-target-is-a-directory-not-an-assumption). Keeping them apart matters: `fleet-gate.json` says *how hard to enforce*, `fleet-target.json` says *what to enforce it over*.
+
+**Reads are not gated.** See `docs/assignment-confinement.md` for why that half of the confinement is still undecided.
 
 ## License
 

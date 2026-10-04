@@ -608,7 +608,7 @@ export default function (pi: ExtensionAPI) {
     name: "fleet_status",
     label: "Fleet Status",
     description:
-      "Read the current Macro Architecture Fleet state: phase, artifact presence, decision queue, and what blocks the next phase. Call this before acting so you do not guess where the job is.",
+      "Read the current pi-force state: phase, artifact presence, decision queue, and what blocks the next phase. Call this before acting so you do not guess where the job is.",
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _onUpdate, ctx) {
       if (aborted(signal)) return ABORTED_RESULT;

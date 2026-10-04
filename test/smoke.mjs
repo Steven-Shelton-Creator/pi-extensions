@@ -1,5 +1,5 @@
 /**
- * Functional smoke test for the Macro Architecture Fleet extensions.
+ * Functional smoke test for the pi-force extensions.
  *
  * Exercises the enforcement layer end to end: phase gates, the tool_call write
  * gate, contract freeze, and the structural verifier (including the two

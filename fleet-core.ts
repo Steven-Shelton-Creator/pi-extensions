@@ -1,5 +1,5 @@
 /**
- * fleet-core :: shared state, gates, and enforcement for the Macro Architecture Fleet
+ * fleet-core :: shared state, gates, and enforcement for the pi-force
  *
  * This module is the single source of truth for:
  *   - the phase table
@@ -1172,7 +1172,7 @@ export function phaseBrief(state: FleetState): string {
   if (!state.job.objective) return "";
   const phase = PHASES[state.currentPhase];
   const lines: string[] = [];
-  lines.push(`## Macro Architecture Fleet — active`);
+  lines.push(`## pi-force — active`);
   lines.push(`Job: ${state.job.objective}`);
   lines.push(`Target: ${targetRoot()} (artifacts in ${archDirName()}/)`);
   lines.push(`Current phase: ${state.currentPhase} (${phase.label})`);

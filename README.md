@@ -1,4 +1,4 @@
-# pi-extensions — Macro Architecture Fleet
+# pi-force
 
 Phase-gated architecture workflow extensions for [pi](https://github.com/earendil-works/pi), with the phase order **enforced in code** rather than described in a prompt.
 

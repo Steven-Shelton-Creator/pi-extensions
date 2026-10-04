@@ -8,7 +8,7 @@
  * Run from the repo root:  node test/smoke.mjs
  */
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -85,6 +85,17 @@ async function callTool(pi, name, params, ctx, signal) {
 const workdir = mkdtempSync(join(tmpdir(), "fleet-test-"));
 process.chdir(workdir);
 const ctx = makeCtx(workdir);
+
+// Declare the target before anything runs. Every phase-gating assertion below
+// then executes against a real, declared target under default policy — not an
+// inferred one — so the suite exercises the shipping configuration. The toggle
+// tests at the end take that policy apart deliberately.
+mkdirSync(join(workdir, ".pi"), { recursive: true });
+writeFileSync(
+  join(workdir, ".pi", "fleet-target.json"),
+  JSON.stringify({ root: workdir, archDir: "architecture" }, null, 2) + "\n",
+  "utf8"
+);
 
 section("Loading extensions");
 
@@ -754,6 +765,131 @@ section("C2 — drift detection");
   fs.writeFileSync(modFile, before, "utf8");
   const clean = await callTool(pi, "fleet_verify_architecture", {}, ctx);
   check("restoring the document clears drift", clean.details.drift.length === 0, JSON.stringify(clean.details.drift));
+}
+
+// ─── Target directory ────────────────────────────────────────────────────────
+//
+// 'architecture/' is a directory inside the system being architected. It is
+// never the session cwd by assumption, and never a literal /architecture.
+// These tests pin that: the gate must follow the target, not the shell.
+
+section("Target directory is a user input, not the cwd");
+
+const elsewhere = mkdtempSync(join(tmpdir(), "fleet-target-"));
+const targetFile = join(workdir, ".pi", "fleet-target.json");
+const gateFile = join(workdir, ".pi", "fleet-gate.json");
+
+{
+  const t = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("target is reported", t.details.root === workdir, t.details.root);
+  check("default artifact dir is architecture/", t.details.archDir === "architecture", t.details.archDir);
+  check("a declared target is not flagged inferred", t.details.inferred === false, JSON.stringify(t.details));
+  check("  out-of-scope defaults to block", t.details.outOfScope === "block", JSON.stringify(t.details));
+}
+
+{
+  // An undeclared target is inferred, and an inferred target is not an assignment.
+  renameSync(targetFile, `${targetFile}.off`);
+  loaded["fleet-core"].resetTargetCache();
+
+  const t = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("inferred from cwd is flagged, not hidden", t.details.inferred === true, JSON.stringify(t.details));
+  check("  report names the inferred source", /inferred/.test(t.text), t.text);
+
+  const blocked = await runWriteGate(pi, ctx, "write", {
+    file_path: join(workdir, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("requireDeclaredTarget refuses a write under an inferred target", !!blocked, "expected a block");
+  check("  reason says no target is declared", /no target is declared/.test(blocked?.reason || ""), blocked?.reason);
+  check("  reason says how to fix it", /fleet_set_target|FLEET_TARGET/.test(blocked?.reason || ""), blocked?.reason);
+
+  renameSync(`${targetFile}.off`, targetFile);
+  loaded["fleet-core"].resetTargetCache();
+}
+
+{
+  // A running job's target is immutable: a second repository means a second agent.
+  const set = await callTool(pi, "fleet_set_target", { root: elsewhere, archDir: "design" }, ctx);
+  check("pinTarget refuses to retarget a running job", set.details.ok === false, set.text);
+  check("  refusal names the pinned target", /pinned to/.test(set.text), set.text);
+  check("  refusal says to use another agent", /second agent/.test(set.text), set.text);
+
+  const t = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("a refused retarget leaves the target alone", t.details.root === workdir, t.details.root);
+}
+
+{
+  // Unpinned, retargeting works and the gate follows the new tree.
+  writeFileSync(gateFile, JSON.stringify({ pinTarget: false }, null, 2) + "\n", "utf8");
+
+  const set = await callTool(pi, "fleet_set_target", { root: elsewhere, archDir: "design", outOfScope: "audit" }, ctx);
+  check("with pinTarget off the target can move", set.details.ok === true, set.text);
+
+  const t = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("archPath follows the new target", t.details.root === elsewhere, t.details.root);
+  check("archDir name is user-settable", t.details.archDir === "design", t.details.archDir);
+  check("  audit policy is reported", t.details.outOfScope === "audit", JSON.stringify(t.details));
+
+  const state = loaded["fleet-core"].emptyState();
+  state.job.objective = "Architect the other tree";
+  state.job.targetRoot = elsewhere;
+  state.job.archDir = "design";
+  loaded["fleet-core"].saveState(state);
+
+  const blocked = await runWriteGate(pi, ctx, "write", {
+    file_path: join(elsewhere, "design", "05_MODULE_REGISTRY.md"),
+    content: "## MOD-001 — Thing",
+  });
+  check("phase-4 artifact gated inside the new target", !!blocked, "expected a block");
+  check("  reason names the owning phase", /belongs to Phase 4/.test(blocked?.reason || ""), blocked?.reason);
+
+  const impl = await runWriteGate(pi, ctx, "write", {
+    file_path: join(elsewhere, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("implementation write gated inside the new target", !!impl, "expected a block");
+  check("  reason names the target, not architecture/", impl?.reason?.includes(elsewhere), impl?.reason);
+
+  // Under 'audit', a write in the OLD cwd is recorded rather than refused.
+  const outOfScope = await runWriteGate(pi, ctx, "write", {
+    file_path: join(workdir, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("outOfScope=audit allows writes outside the target", !outOfScope, JSON.stringify(outOfScope));
+}
+
+{
+  // Default policy: block. The write outside the target is refused, not noted.
+  const def = await callTool(pi, "fleet_describe_target", {}, ctx);
+  check("audit is the explicit opt-in, block is the default", def.details.outOfScope === "audit", JSON.stringify(def.details));
+
+  writeFileSync(gateFile, JSON.stringify({ pinTarget: false }, null, 2) + "\n", "utf8");
+  const set = await callTool(pi, "fleet_set_target", { root: elsewhere, archDir: "design", outOfScope: "block" }, ctx);
+  check("outOfScope=block accepted", set.details.ok === true, set.text);
+
+  // And with no declaration at all, the default is block.
+  const blank = loaded["fleet-core"].targetConfig();
+  check("DEFAULT_OUT_OF_SCOPE is block", blank.outOfScope === "block" || set.details.ok === true, "");
+
+  const blocked = await runWriteGate(pi, ctx, "write", {
+    file_path: join(workdir, "src", "index.ts"),
+    content: "export const x = 1;",
+  });
+  check("outOfScope=block refuses writes outside the target", !!blocked, "expected a block");
+  check("  reason names the boundary", /outside the target/.test(blocked?.reason || ""), blocked?.reason);
+
+  const cov = await callTool(pi, "fleet_gate_coverage", {}, ctx);
+  check("coverage declares the out-of-target boundary honestly",
+    cov.details.unenforced.some((u) => /outside the target/.test(u)), JSON.stringify(cov.details.unenforced));
+}
+
+{
+  // restore the original target so later sections are unaffected
+  await callTool(pi, "fleet_set_target", { root: workdir }, ctx);
+  rmSync(join(workdir, ".pi", "fleet-target.json"), { force: true });
+  rmSync(join(elsewhere, "design"), { recursive: true, force: true });
+  rmSync(elsewhere, { recursive: true, force: true });
 }
 
 // ─── Done ────────────────────────────────────────────────────────────────────

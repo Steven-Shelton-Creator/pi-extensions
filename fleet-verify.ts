@@ -28,7 +28,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import {
   PHASES, PRIM_FILE, FMT_FILE, INT_FILE, MOD_FILE, DEP_FILE, VER_FILE,
   archPath, ensureArchDir, loadState, saveState, audit,

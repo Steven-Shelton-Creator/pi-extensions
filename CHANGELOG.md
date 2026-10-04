@@ -15,13 +15,121 @@ still exist.
 | 0.2.0 | `a1697ad` | `feat/enforced-phase-machine` | merge commit — PR #1 |
 | 0.3.0 | `ce1da26` | `feat/gate-hardening` | direct push |
 
-`main` is at `ce1da26`, clean, with 181 assertions passing.
+`main` is at `ce1da26`, clean, with 181 assertions passing. Two commits sit
+unreleased on `fc/target-directory`: `9c4f0fb` (target as user input) and
+`8cd4721` (typebox import specifier), taking the suite to 209 assertions.
 
 Two notes on history. PR #1 merged as a no-content merge commit — `a1697ad`'s
 tree is byte-identical to `a10c5fb`, its parent — so 0.3.0 could not fast-forward
 onto it and was rebased instead. Its feature commits are therefore `57e44d0` and
 `d6b4d05` on `main`, not the `0bb5fff` and `7006a71` on their branch. The rebase
 changed history, not content: `git diff` before and after was empty.
+
+---
+
+## [Unreleased] — confinement toggles
+
+**Branch:** `fc/target-directory` · **Tests:** 209 assertions, 0 failures
+
+The target can be declared now, but a declaration alone is not a boundary.
+Three policy decisions were being made implicitly by defaults rather than by
+the user, so each became a toggle that ships in the strict position.
+
+### Fixed
+
+- **The extensions could not load in pi at all (High).** All ten files imported
+  `{ Type }` from `@sinclair/typebox` — the pre-1.0 scoped name. pi ships
+  `typebox@1.3.7` under the unscoped name, and its extension loader aliases
+  exactly one spelling (`"typebox": _bundledTypebox`), which is also what pi's
+  own docs, examples, and internal tools use. `@sinclair/typebox` is not in the
+  alias table and this package declared no dependencies, so every module failed
+  to resolve with `ERR_MODULE_NOT_FOUND`. The suite missed it because a
+  hand-written stand-in package named `@sinclair/typebox` sat in `node_modules`;
+  the harness invokes handlers directly and never inspects generated schemas,
+  and `fleet-core.ts` — where all the gate logic lives — does not import
+  typebox at all. Imports are now `from "typebox"`, matching the loader.
+- **`outOfScope: "audit"` was unreachable from config.** `normalizeOutOfScope`
+  returned the *default* for any value that was not literally `"block"`, so with
+  the default flipped to `"block"` an explicit `"audit"` silently resolved to
+  `"block"`. Harmless while the default was `"audit"`; a deny-by-default gate
+  that cannot be loosened by configuration once the change landed.
+- **`node_modules/` in `.gitignore`** did not match the symlink that was
+  shadowing the stub, because a trailing slash matches directories only.
+
+### Changed
+
+- **`outOfScope` now defaults to `"block"`.** Previously an out-of-target write
+  before the implementation phase was allowed and logged as `OUT-OF-SCOPE`.
+  Refused by default now; `"audit"` is the deliberate opt-in. A boundary that
+  records rather than refuses is a promise the agent can defer.
+- **`requireDeclaredTarget` (default `true`).** A target inferred from cwd is
+  flagged but no longer sufficient to write into. An unassigned agent has no
+  business writing anywhere, and cwd is the one directory nobody chose.
+- **`pinTarget` (default `true`).** `/fleet:target` and `fleet_set_target` are
+  refused while a job exists. A pinned target is part of the job record;
+  re-pointing it relocates the boundary underneath work already recorded
+  against it. A second repository means a second agent.
+
+### Added
+
+- `docs/assignment-confinement.md` — the read half of confinement, recorded and
+  deliberately unimplemented. Reads are not gated in any phase under any policy;
+  an agent confined to one repository can still read the rest of the vault and
+  fold it into the architecture, which no write gate can detect.
+- `fleet_describe_target` now reports the resolved out-of-scope policy.
+
+### Notes
+
+- The three toggles live in `.pi/fleet-gate.json` — "how hard to enforce".
+  `fleet-target.json` keeps "what to enforce it over". All three ship strict.
+- Tests declare a real target in the fixture, so the suite exercises the
+  shipping configuration rather than an inferred one.
+
+---
+
+## [Unreleased] — target directory
+
+**Branch:** `fc/target-directory` · **Tests:** 198 assertions, 0 failures (up from 181)
+
+`architecture/` is now a directory inside the system being architected, and the
+target is a user input rather than an assumption.
+
+### Fixed
+
+- **The gate governed whatever tree pi was launched in (High).** `cwd()` returned
+  `process.cwd()` and stood in for the target. Two consequences: the gate locked
+  down a tree the user never named, and because `evaluateWriteGate` refused every
+  write *outside* `architecture/`, launching pi in `$HOME` silently placed an
+  entire home directory under phase lock. Same class as the 0.1.0 self-seeding
+  and 0.3.0 stale-verdict defects: the gate trusting a value that does not
+  describe what the user meant. The target is now resolved from `FLEET_TARGET`,
+  `.pi/fleet-target.json`, or the job's pinned target, with a cwd fallback that
+  is always flagged `inferred` and surfaced by `fleet_describe_target`.
+- **Scope is now the target, not the artifact directory.** The gate's question
+  changes from "is this write outside `architecture/`?" to "is this write inside
+  the project being architected?" — so pointing a job at another tree no longer
+  gates the old one and leaves the new one open. `archDir` is configurable too.
+- **Phase brief said `architecture/` when the target was elsewhere.** The brief
+  and the gate's block reasons now name the resolved target and artifact path.
+- **`phaseBrief` never announced frozen contracts.** `phase.currentPhase` read a
+  property that `PhaseDef` does not have, so the guard was always `undefined`
+  and the frozen-contracts reminder never fired. (`state.currentPhase` was meant.)
+
+### Added
+
+- `/fleet:target [path] [archDir]`, `fleet_set_target`, `fleet_describe_target`.
+- `outOfScope` policy: `audit` (default — out-of-target writes are allowed and
+  logged as `OUT-OF-SCOPE`) or `block` (the previous conservative reading).
+- 17 assertions covering target resolution, artifact gating inside a retargeted
+  job, and both out-of-scope policies.
+
+### Notes
+
+- Narrowing the gate's reach is itself a change in what the gate promises, so it
+  is declared in `fleet_gate_coverage`'s `unenforced` list rather than left to be
+  discovered.
+- `fleet:new-job` now asks for the target before writing anything and pins it into
+  the store, so the target cannot drift onto another tree mid-job.
 
 ---
 

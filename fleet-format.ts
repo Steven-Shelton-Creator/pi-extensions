@@ -17,7 +17,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import {
   FMT_FILE, INT_FILE, archPath, ensureArchDir, loadState, saveState, audit, phaseBrief, aborted, ABORTED_RESULT } from "./fleet-core.ts";
 import type { FleetState } from "./fleet-core.ts";
